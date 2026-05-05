@@ -123,24 +123,39 @@ with st.sidebar:
     if not df_all.empty and code in df_all["code"].values:
         name = df_all[df_all["code"] == code]["name"].values[0]
 
-        # 实时价格
-        p, chg, color = None, None, "#aaa"
-        rt = query("SELECT price, change_pct FROM realtime WHERE code=?", [code])
+        # 实时行情
+        p, chg, color, r = None, None, "#aaa", {}
+        rt = query("SELECT * FROM realtime WHERE code=?", [code])
         if not rt.empty:
-            p = rt.iloc[0]["price"]
-            chg = rt.iloc[0]["change_pct"]
+            r = rt.iloc[0].to_dict()
+            p = r.get("price")
+            chg = r.get("change_pct")
             if chg is not None:
                 color = "#ff6b6b" if chg > 0 else ("#51cf66" if chg < 0 else "#aaa")
 
         price_str = f"{p:.2f}" if p else "--"
         chg_str = f"{chg:+.2f}%" if chg is not None else "--"
+        mv = r.get("total_mv")
+        mv_str = f"{mv/1e8:.0f}亿" if (mv and mv > 0) else "--"
+        pe_val = r.get("pe")
+        pe_str = f"{pe_val:.1f}" if (pe_val and pe_val > 0) else "--"
+        pb_val = r.get("pb")
+        pb_str = f"{pb_val:.2f}" if (pb_val and pb_val > 0) else "--"
+        to_val = r.get("turnover")
+        to_str = f"{to_val:.2f}%" if to_val else "--"
 
         st.markdown(f"""
         <div class="stock-card">
             <div style="font-size:22px; font-weight:bold; color:#222;">{code}</div>
-            <div style="font-size:14px; color:#888; margin:4px 0 10px;">{name}</div>
+            <div style="font-size:14px; color:#888; margin:2px 0 8px;">{name}</div>
             <div style="font-size:30px; font-weight:bold; color:{color};">{price_str}</div>
-            <div style="font-size:15px; color:{color}; margin-top:2px;">{chg_str}</div>
+            <div style="font-size:15px; color:{color}; margin:2px 0 8px;">{chg_str}</div>
+            <table style="width:100%; font-size:12px; color:#666;">
+                <tr><td>总市值</td><td style="text-align:right; font-weight:600; color:#333;">{mv_str}</td></tr>
+                <tr><td>PE(TTM)</td><td style="text-align:right; font-weight:600; color:#333;">{pe_str}</td></tr>
+                <tr><td>PB</td><td style="text-align:right; font-weight:600; color:#333;">{pb_str}</td></tr>
+                <tr><td>换手率</td><td style="text-align:right; font-weight:600; color:#333;">{to_str}</td></tr>
+            </table>
         </div>
         """, unsafe_allow_html=True)
 
@@ -343,34 +358,62 @@ with tab1:
 with tab2:
     # ── 周期选择 ──────────────────────────────────────
     tf_map = {
+        "分时": ("minute", 240, None),
+        "5分钟": ("minute", 2000, None),
         "日线": ("daily", 400, None),
-        "5日": ("daily", 2000, "5D"),
-        "10日": ("daily", 2000, "10D"),
         "周线": ("daily", 2000, "W"),
         "月线": ("daily", 5000, "M"),
         "半年线": ("daily", 5000, "6M"),
         "年线": ("daily", 5000, "Y"),
     }
-    c_tf, c_dummy = st.columns([3, 9])
+    c_tf, c_ind1, c_ind2, c_dummy = st.columns([2, 2, 2, 6])
     with c_tf:
-        timeframe = st.selectbox("K线周期", list(tf_map.keys()), index=0, key="kline_tf")
-    fetch_days, resample_rule = tf_map[timeframe][1], tf_map[timeframe][2]
+        timeframe = st.selectbox("周期", list(tf_map.keys()), index=0, key="kline_tf")
+    with c_ind1:
+        show_macd = st.checkbox("MACD", value=True, key="ind_macd")
+    with c_ind2:
+        show_kdj = st.checkbox("KDJ", key="ind_kdj")
+    source_type, fetch_days, resample_rule = tf_map[timeframe]
 
     c_left, c_right = st.columns([7, 3])
 
     with c_left:
-        df_hist = query(
-            f"SELECT date, open, high, low, close, volume FROM history "
-            f"WHERE code=? ORDER BY date DESC LIMIT {fetch_days}",
-            [code],
-        )
-        if not df_hist.empty:
-            df_hist = df_hist.iloc[::-1].copy()  # 反转为升序
-            df_hist["date"] = pd.to_datetime(df_hist["date"])
-            df_hist.set_index("date", inplace=True)
+        df_hist = None
+        # ── 分钟数据从 AKShare 实时获取 ──────────
+        if source_type == "minute":
+            import akshare as ak
+            prefix = "sh" if code.startswith("6") else "sz"
+            try:
+                df_min = ak.stock_zh_a_minute(symbol=f"{prefix}{code}", period="5")
+                if not df_min.empty:
+                    df_min["day"] = pd.to_datetime(df_min["day"])
+                    df_min = df_min.rename(columns={"day": "date"})
+                    df_min.set_index("date", inplace=True)
+                    # AKShare 分钟数据可能是字符串，全部转数值
+                    for col in ["open", "high", "low", "close", "volume", "amount"]:
+                        if col in df_min.columns:
+                            df_min[col] = pd.to_numeric(df_min[col], errors="coerce")
+                    if timeframe == "分时":
+                        latest_day = df_min.index.max().date()
+                        df_min = df_min[df_min.index.date == latest_day]
+                    df_hist = df_min
+            except Exception:
+                df_hist = pd.DataFrame()
 
+        if df_hist is None:
+            df_hist = query(
+                f"SELECT date, open, high, low, close, volume FROM history "
+                f"WHERE code=? ORDER BY date DESC LIMIT {fetch_days}",
+                [code],
+            )
+            if not df_hist.empty:
+                df_hist = df_hist.iloc[::-1].copy()
+                df_hist["date"] = pd.to_datetime(df_hist["date"])
+                df_hist.set_index("date", inplace=True)
+
+        if df_hist is not None and not df_hist.empty:
             # ── 重采样到目标周期 ─────────────────────
-            if resample_rule:
+            if resample_rule and source_type == "daily":
                 df_resampled = df_hist.resample(resample_rule).agg({
                     "open": "first", "high": "max", "low": "min",
                     "close": "last", "volume": "sum",
@@ -384,61 +427,139 @@ with tab2:
             high = data["high"]
             low = data["low"]
             vol = data["volume"]
+            is_intraday = timeframe in ("分时", "5分钟")
 
-            # ── 连续索引消除所有假期空白 ─────────────
+            # ── 连续索引 ─────────────────────────────
             n_bars = len(data)
             idx = list(range(n_bars))
-            # 选取关键日期作为刻度标签（约10个）
             step = max(1, n_bars // 10)
             tick_vals = idx[::step]
-            tick_text = [d.strftime("%Y-%m") if resample_rule in ("M", "6M", "Y")
-                         else d.strftime("%m/%d") for d in data["date"].iloc[::step]]
+            if is_intraday:
+                tick_text = [d.strftime("%H:%M") for d in data["date"].iloc[::step]]
+            elif resample_rule in ("M", "6M", "Y"):
+                tick_text = [d.strftime("%Y-%m") for d in data["date"].iloc[::step]]
+            else:
+                tick_text = [d.strftime("%m/%d") for d in data["date"].iloc[::step]]
 
             # MA 均线
             ma5 = close.rolling(5, min_periods=1).mean()
             ma20 = close.rolling(20, min_periods=1).mean()
             ma60 = close.rolling(60, min_periods=1).mean()
 
-            # ── 主力吸筹指标 ──────────────────────────
-            hilo = high - low
-            hilo_safe = hilo.replace(0, np.nan)
-            raw_mf = ((close - low) - (high - close)) / hilo_safe * vol
-            raw_mf = raw_mf.fillna(0)
-            acc_line = raw_mf.cumsum() / 1e6
+            # ── 技术指标 ──────────────────────────────
+            macd_line = macd_signal = macd_hist = k_val = d_val = j_val = None
+            if not is_intraday:
+                ema12 = close.ewm(span=12, adjust=False).mean()
+                ema26 = close.ewm(span=26, adjust=False).mean()
+                macd_line = ema12 - ema26
+                macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+                macd_hist = macd_line - macd_signal
 
-            # ── 三栏子图 ─────────────────────────────
+                low9 = low.rolling(9, min_periods=1).min()
+                high9 = high.rolling(9, min_periods=1).max()
+                rsv = (close - low9) / (high9 - low9).replace(0, np.nan) * 100
+                k_val = rsv.ewm(alpha=1/3, adjust=False).mean()
+                d_val = k_val.ewm(alpha=1/3, adjust=False).mean()
+                j_val = 3 * k_val - 2 * d_val
+
+            # ── 动态子图行数 ─────────────────────────
+            n_extra = (1 if show_macd and not is_intraday else 0) + (1 if show_kdj and not is_intraday else 0)
+            n_rows = 2 + n_extra
+            row_heights = [0.7] + (([0.15] if show_macd and not is_intraday else [])) + (([0.15] if show_kdj and not is_intraday else [])) + [0.3]
+            row_heights = [h / sum(row_heights) for h in row_heights]
+
             fig = make_subplots(
-                rows=3, cols=1, shared_xaxes=True,
-                vertical_spacing=0.02,
-                row_heights=[0.55, 0.22, 0.23],
+                rows=n_rows, cols=1, shared_xaxes=True,
+                vertical_spacing=0.01,
+                row_heights=row_heights,
             )
 
-            fig.add_trace(go.Candlestick(
-                x=idx, open=data["open"], high=high, low=low, close=close,
-                name="K线",
-                increasing=dict(line=dict(color=UP_RED), fillcolor=UP_RED),
-                decreasing=dict(line=dict(color=DOWN_GREEN), fillcolor=DOWN_GREEN),
-                showlegend=False, hovertext=data["date"].dt.strftime("%Y-%m-%d"),
-            ), row=1, col=1)
+            # 行号分配
+            row_k = 1
+            row_macd = 2 if show_macd else None
+            row_kdj = (2 if not show_macd else 3) if show_kdj else None
+            row_vol = n_rows
 
-            fig.add_trace(go.Scatter(
-                x=idx, y=ma5, line=dict(color="#f39c12", width=1), name="MA5",
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=idx, y=ma20, line=dict(color="#3498db", width=1.2), name="MA20",
-            ), row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=idx, y=ma60, line=dict(color="#9b59b6", width=1.2), name="MA60",
-            ), row=1, col=1)
+            # 价格图
+            if timeframe == "分时":
+                # 昨收从日线表取
+                yest_close = data["open"].iloc[0]
+                today_str = data["date"].iloc[0].strftime("%Y%m%d")
+                df_yc = query("SELECT close FROM history WHERE code=? AND date<? ORDER BY date DESC LIMIT 1", [code, today_str])
+                if not df_yc.empty:
+                    yest_close = float(df_yc.iloc[0]["close"])
 
-            # 主力吸筹（纯线条，避免填充干扰 auto-range）
-            fig.add_trace(go.Scatter(
-                x=idx, y=acc_line, mode="lines",
-                line=dict(color="#e67e22", width=2),
-                name="主力吸筹(百万)", showlegend=False,
-                hovertext=data["date"].dt.strftime("%Y-%m-%d"),
-            ), row=2, col=1)
-            fig.add_hline(y=0, line_dash="dash", line_color="#bbb", row=2, col=1)
+                # 涨跌幅(%)
+                chg_pct = (close - yest_close) / yest_close * 100
+
+                fig.add_trace(go.Scatter(
+                    x=idx, y=chg_pct, mode="lines",
+                    line=dict(color="#667eea", width=1.5),
+                    name="涨跌幅", showlegend=False,
+                    fill="tozeroy", fillcolor="rgba(102,126,234,0.1)",
+                    hovertemplate="%{text}<br>价格: %{customdata:.2f}<br>涨跌: %{y:+.2f}%",
+                    text=[d.strftime("%H:%M") for d in data["date"]],
+                    customdata=close,
+                ), row=row_k, col=1)
+                # 零轴
+                fig.add_hline(y=0, line_dash="dash", line_color="#999",
+                              row=row_k, col=1)
+                # 均价线（涨跌幅）
+                avg_price = (vol * close).cumsum() / vol.cumsum()
+                avg_chg = (avg_price - yest_close) / yest_close * 100
+                fig.add_trace(go.Scatter(
+                    x=idx, y=avg_chg, mode="lines",
+                    line=dict(color="#f39c12", width=1, dash="dot"),
+                    name="均价", showlegend=False,
+                ), row=row_k, col=1)
+
+                # y 轴标签（在下面统一设置处会覆盖，需在此处理）
+            else:
+                fig.add_trace(go.Candlestick(
+                    x=idx, open=data["open"], high=high, low=low, close=close,
+                    name="K线", showlegend=False,
+                    increasing=dict(line=dict(color=UP_RED), fillcolor=UP_RED),
+                    decreasing=dict(line=dict(color=DOWN_GREEN), fillcolor=DOWN_GREEN),
+                    hovertext=data["date"].dt.strftime("%Y-%m-%d %H:%M" if is_intraday else "%Y-%m-%d"),
+                ), row=row_k, col=1)
+                fig.add_trace(go.Scatter(
+                    x=idx, y=ma5, line=dict(color="#f39c12", width=1), name="MA5",
+                ), row=row_k, col=1)
+                fig.add_trace(go.Scatter(
+                    x=idx, y=ma20, line=dict(color="#3498db", width=1.2), name="MA20",
+                ), row=row_k, col=1)
+                fig.add_trace(go.Scatter(
+                    x=idx, y=ma60, line=dict(color="#9b59b6", width=1.2), name="MA60",
+                ), row=row_k, col=1)
+
+            # MACD（非分时模式）
+            if show_macd and not is_intraday:
+                fig.add_trace(go.Bar(
+                    x=idx, y=macd_hist, name="MACD柱",
+                    marker=dict(color=[UP_RED if v>=0 else DOWN_GREEN for v in macd_hist], opacity=0.7),
+                    showlegend=False,
+                ), row=row_macd, col=1)
+                fig.add_trace(go.Scatter(
+                    x=idx, y=macd_line, line=dict(color="#e74c3c", width=1), name="DIF",
+                ), row=row_macd, col=1)
+                fig.add_trace(go.Scatter(
+                    x=idx, y=macd_signal, line=dict(color="#3498db", width=1), name="DEA",
+                ), row=row_macd, col=1)
+                fig.add_hline(y=0, line_dash="dash", line_color="#bbb", row=row_macd, col=1)
+
+            # KDJ（非分时模式）
+            if show_kdj and not is_intraday:
+                fig.add_trace(go.Scatter(
+                    x=idx, y=k_val, line=dict(color="#e74c3c", width=1), name="K",
+                ), row=row_kdj, col=1)
+                fig.add_trace(go.Scatter(
+                    x=idx, y=d_val, line=dict(color="#3498db", width=1), name="D",
+                ), row=row_kdj, col=1)
+                fig.add_trace(go.Scatter(
+                    x=idx, y=j_val, line=dict(color="#9b59b6", width=1, dash="dot"), name="J",
+                ), row=row_kdj, col=1)
+                fig.add_hline(y=80, line_dash="dash", line_color="#bbb", row=row_kdj, col=1)
+                fig.add_hline(y=20, line_dash="dash", line_color="#bbb", row=row_kdj, col=1)
 
             # 成交量
             vol_colors = [UP_RED if close.iloc[i] >= data["open"].iloc[i] else DOWN_GREEN
@@ -448,17 +569,26 @@ with tab2:
                 marker=dict(color=vol_colors, opacity=0.5),
                 showlegend=False,
                 hovertext=data["date"].dt.strftime("%Y-%m-%d"),
-            ), row=3, col=1)
+            ), row=row_vol, col=1)
+
+            # 动态布局
+            if timeframe == "分时":
+                yaxis_dict = {"yaxis": dict(title="涨跌幅(%)", side="right", autorange=True, fixedrange=False, ticksuffix="%", **PLOT_AXIS)}
+            else:
+                yaxis_dict = {"yaxis": dict(title="价格", side="right", autorange=True, fixedrange=False, **PLOT_AXIS)}
+            yaxis_dict[f"yaxis{row_vol}"] = dict(title="成交量", side="right", autorange=True, fixedrange=False, **PLOT_AXIS)
+            if show_macd:
+                yaxis_dict[f"yaxis{row_macd}"] = dict(title="MACD", side="right", autorange=True, fixedrange=False, **PLOT_AXIS)
+            if show_kdj:
+                yaxis_dict[f"yaxis{row_kdj}"] = dict(title="KDJ", side="right", autorange=True, fixedrange=False, **PLOT_AXIS)
+
+            xaxis_dict = {"xaxis": dict(tickvals=tick_vals, ticktext=tick_text, **PLOT_AXIS)}
+            xaxis_dict[f"xaxis{row_vol}"] = dict(tickvals=tick_vals, ticktext=tick_text, **PLOT_AXIS)
 
             fig.update_layout(
-                **PLOT_LAYOUT, height=600,
+                **PLOT_LAYOUT, height=180 + n_rows * 120,
                 xaxis_rangeslider_visible=False,
-                xaxis=dict(tickvals=tick_vals, ticktext=tick_text, **PLOT_AXIS),
-                xaxis2=dict(tickvals=tick_vals, ticktext=[""]*len(tick_vals), **PLOT_AXIS),
-                xaxis3=dict(tickvals=tick_vals, ticktext=tick_text, **PLOT_AXIS),
-                yaxis=dict(title="价格", side="right", autorange=True, fixedrange=False, **PLOT_AXIS),
-                yaxis2=dict(title="吸筹(百万)", side="right", autorange=True, fixedrange=False, **PLOT_AXIS),
-                yaxis3=dict(title="成交量", side="right", autorange=True, fixedrange=False, **PLOT_AXIS),
+                **xaxis_dict, **yaxis_dict,
             )
 
             st.plotly_chart(fig, width="stretch", config={
@@ -574,8 +704,32 @@ with tab3:
                     code, strategy=strat,
                     start=start_date.strftime("%Y%m%d"),
                     end=end_date.strftime("%Y%m%d"),
-                    initial_cash=int(cash),
+                    initial_cash=int(cash), return_equity=True,
                 )
+                # 净值曲线
+                if result.get("equity") and result.get("equity_dates"):
+                    eq = result["equity"]
+                    dates = pd.to_datetime(result["equity_dates"])
+                    # 买入持有基准
+                    bench = run_backtest(code, "buy_hold",
+                        start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"),
+                        int(cash), return_equity=True,
+                    )
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(
+                        x=dates, y=eq, mode="lines",
+                        line=dict(color="#667eea", width=2), name=strat,
+                    ))
+                    if bench.get("equity") and len(bench["equity"]) == len(eq):
+                        fig_eq.add_trace(go.Scatter(
+                            x=dates, y=bench["equity"],
+                            line=dict(color="#bbb", width=1.5, dash="dash"),
+                            name="买入持有",
+                        ))
+                    fig_eq.update_layout(**PLOT_LAYOUT, height=300,
+                        yaxis=dict(title="净值", side="right", autorange=True, **PLOT_AXIS))
+                    st.plotly_chart(fig_eq, width="stretch")
+
                 # 绩效卡片
                 c1, c2, c3, c4, c5 = st.columns(5)
                 total_ret = result["total_return_pct"]

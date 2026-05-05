@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 from database import query, table_exists
+from fetchers.industry import get_industry_list as _get_industries
 
 
 # ═══════════════════════════════════════════════════════════
@@ -334,6 +335,16 @@ def _estimate_roe(df):
     return roe
 
 
+def _filter_industry(df, val):
+    """行业过滤。需要先抓取行业数据: python main.py industry"""
+    from fetchers.industry import get_industry
+    ind_df = get_industry()
+    if ind_df.empty:
+        return df
+    codes_in_industry = set(ind_df[ind_df["industry"] == val]["code"])
+    return df[df["code"].isin(codes_in_industry)]
+
+
 _FILTERS = {
     "pe_max": _filter_pe_max,
     "pe_min": _filter_pe_min,
@@ -349,4 +360,5 @@ _FILTERS = {
     "roe_min": _filter_roe_min,
     "revenue_growth": _filter_revenue_growth,
     "profit_growth": _filter_profit_growth,
+    "industry": _filter_industry,
 }

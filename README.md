@@ -157,10 +157,9 @@ python main.py export --table history --format csv
 # 策略回测（14 种策略可选）
 python main.py backtest --code 000559 --strategy macd
 
-# 参数优化（网格搜索最优参数）
+# 参数优化 + 滚动窗口验证 + 组合回测 + 基准对比
 python main.py optimize --code 000559 --strategy sma_cross
-
-# 组合回测 + 基准对比
+python main.py rolling --code 000559 --strategy sma_cross
 python main.py portfolio --codes "000001,600519,300750" --strategy macd
 python main.py benchmark --code 000559 --strategy cci
 
@@ -183,7 +182,7 @@ python main.py dashboard
 
 | 命令 | 数据内容 | 来源 |
 |------|----------|------|
-| `realtime` | 全市场实时行情（最新价、涨跌幅、成交量、PE/PB 等） | 东方财富 |
+| `realtime` | 全市场实时行情（最新价/涨跌幅/PE/PB/市值/换手率/量比/60日涨跌等） | 东方财富 |
 | `history` | 个股历史K线（日/周/月，前复权） | 东方财富 |
 | `financial` | 利润表、资产负债表、现金流量表 | 新浪财经 |
 | `fund-flow` | 个股每日资金流向（主力/超大单/大单/中单/小单） | 东方财富 |
@@ -194,7 +193,7 @@ python main.py dashboard
 
 ```
 stock/
-├── main.py              # CLI 入口（16 个命令）
+├── main.py              # CLI 入口（17 个命令）
 ├── config.py            # 路径配置 + Windows 编码修复
 ├── database.py          # SQLite 读写
 ├── exporters.py         # CSV/Excel 导出
@@ -205,12 +204,14 @@ stock/
 │   ├── financial.py     # 财务报表
 │   └── fund_flow.py     # 资金流向 / 龙虎榜 / 北向资金
 ├── analytics/           # 量化分析层
-│   ├── backtest.py      # 回测引擎（14 策略 + 参数优化 + 组合回测 + 基准对比）
-│   ├── factors.py       # 因子计算 + IC 分析
-│   ├── screener.py      # 多条件筛选 + 多因子排名（自动过滤 ST/退市）
+│   ├── backtest.py      # 回测引擎（14策略+参数优化+组合+基准+滚动窗口）
+│   ├── factors.py       # 因子计算+IC+截面因子+分层收益
+│   ├── screener.py      # 多条件筛选+多因子排名（行业/技术/基本面，自动过滤ST）
 │   ├── position.py      # 仓位管理（Kelly/波动率/固定比例）
 │   ├── metrics.py       # 绩效指标（夏普/回撤/胜率）
 │   └── signal.py        # 交易建议（买/止盈/止损）
+├── fetchers/
+│   └── industry.py      # 东方财富行业分类
 ├── dashboard/
 │   └── app.py           # Streamlit 看板（6 个 Tab）
 ├── data/                # SQLite 数据库
@@ -517,12 +518,12 @@ python main.py dashboard
 
 # 看板功能：
 #   Tab 1 行情总览 — 涨跌分布/成交额排排/涨跌幅榜（自动过滤 ST）
-#   Tab 2 个股详情 — K线(多周期+主力吸筹)/资金流向/财报/技术指标
+#   Tab 2 个股详情 — K线(分时/5分钟/日/周/月/半年/年+MACD/KDJ)/资金流向/财报/技术指标
 #   Tab 3 策略回测 — 单股回测/基准对比/参数优化/组合回测
 #   Tab 4 因子分析 — 因子值曲线 + IC 分析
 #   Tab 5 股票筛选 — 条件/模板/多因子排名（自动过滤 ST）
 #   Tab 6 交易建议 — 买入/止盈/止损 + 盈亏比
-#   侧边栏     — 代码+名称搜索 + 一键数据抓取
+#   侧边栏     — 代码+名称搜索 + 股票卡片(价/市值/PE/PB/换手) + 一键数据抓取
 ```
 
 ### 场景七：策略研究

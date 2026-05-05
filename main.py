@@ -6,8 +6,8 @@ from fetchers import (
     RealtimeFetcher, HistoryFetcher, FinancialFetcher, FundFlowFetcher
 )
 from analytics import (
-    run_backtest, optimize_backtest, portfolio_backtest, benchmark_compare,
-    calc_factor, factor_ic, screen, rank_screen,
+    run_backtest, optimize_backtest, portfolio_backtest, benchmark_compare, rolling_backtest,
+    calc_factor, factor_ic, cross_section_ic, quantile_returns, screen, rank_screen,
     value_screen, momentum_screen, quality_screen,
     breakout_screen, oversold_screen, growth_screen, get_advice,
 )
@@ -135,6 +135,20 @@ def fund_flow(code, save, export_csv):
         click.echo("已保存到 fund_flow 表")
     if export_csv:
         export("fund_flow", fmt="csv")
+
+
+@cli.command()
+@click.option("--save/--no-save", default=True, help="是否保存到数据库")
+def industry(save):
+    """抓取东方财富行业分类数据"""
+    from fetchers.industry import fetch_industry
+    click.echo("抓取行业分类数据（约 2~3 分钟）...")
+    df = fetch_industry()
+    if df is not None and not df.empty:
+        industries = df["industry"].nunique()
+        click.echo(f"✅ 获取 {len(df)} 只股票, {industries} 个行业")
+    else:
+        click.echo("抓取失败")
 
 
 @cli.command()
@@ -320,6 +334,48 @@ def portfolio(codes, strat, start, end, cash):
     click.echo(f"  胜率:     {result['win_rate_pct']}%")
 
 
+# ── rolling ───────────────────────────────────────────────
+
+@cli.command()
+@click.option("--code", required=True, help="股票代码")
+@click.option("--strategy", "strat", default="sma_cross",
+              type=click.Choice(["sma_cross", "rsi", "macd", "bollinger", "ma_align",
+                                 "turtle", "vol_breakout", "mean_revert", "kdj", "cci"]),
+              help="策略名称")
+@click.option("--start", default="20200101", help="起始日期")
+@click.option("--end", default=None, help="结束日期")
+@click.option("--train-years", default=2, help="训练窗口年数")
+@click.option("--test-months", default=3, help="测试窗口月数")
+@click.option("--cash", default=100000, help="初始资金")
+def rolling(code, strat, start, end, train_years, test_months, cash):
+    """滚动窗口回测 — 样本外验证防过拟合"""
+    click.echo(f"\n🔁 滚动回测: {code} {strat} (训练{train_years}年/测试{test_months}月)")
+
+    try:
+        windows = rolling_backtest(code, strategy=strat, start=start, end=end,
+                                   train_years=int(train_years),
+                                   test_months=int(test_months),
+                                   initial_cash=int(cash))
+    except ValueError as e:
+        click.echo(f"错误: {e}")
+        return
+
+    click.echo(f"\n{'='*75}")
+    click.echo(f"窗口  {'训练区间':<22} {'测试区间':<22} {'策略收益':>8} {'基准':>8} {'超额':>8} {'夏普':>6}")
+    click.echo(f"{'='*75}")
+    wins = []
+    for i, w in enumerate(windows):
+        wins.append(w["excess_return"])
+        click.echo(f"{i+1:>4}  {w['train_period']:<22} {w['test_period']:<22} "
+                   f"{w['strategy_return']:>8.2f} {w['buy_hold_return']:>8.2f} "
+                   f"{w['excess_return']:>8.2f} {w['strategy_sharpe']:>6.2f}")
+    click.echo(f"{'='*75}")
+
+    win_count = sum(1 for w in wins if w > 0)
+    avg_excess = sum(wins) / len(wins) if wins else 0
+    click.echo(f"\n📊 共 {len(windows)} 个窗口 | 跑赢 {win_count}/{len(windows)} | 平均超额: {avg_excess:+.2f}%")
+
+
 # ── benchmark ─────────────────────────────────────────────
 
 @cli.command()
@@ -402,6 +458,7 @@ def factor(code, factor_name, period, ic):
 @click.option("--roe-min", default=None, type=float, help="ROE 下限(%，从财报计算)")
 @click.option("--revenue-growth", default=None, type=float, help="营收增速下限(%)")
 @click.option("--profit-growth", default=None, type=float, help="利润增速下限(%)")
+@click.option("--industry", default=None, type=str, help="行业名称，如 白酒、半导体")
 @click.option("--template", "tpl", default=None,
               type=click.Choice(["value", "momentum", "quality", "breakout", "oversold", "growth"]),
               help="预置筛选模板")
@@ -409,7 +466,7 @@ def factor(code, factor_name, period, ic):
 @click.option("--top", default=20, help="显示前 N 条")
 def screen_cmd(pe_max, pe_min, pb_max, change_min, change_max, turnover_min, turnover_max,
                ma_align, near_high, vol_ratio_min, up_days, roe_min, revenue_growth,
-               profit_growth, tpl, do_rank, top):
+               profit_growth, industry, tpl, do_rank, top):
     """多条件股票筛选 — 技术面 + 基本面 + 多因子打分"""
 
     if do_rank:
@@ -462,6 +519,8 @@ def screen_cmd(pe_max, pe_min, pb_max, change_min, change_max, turnover_min, tur
             conditions["revenue_growth"] = revenue_growth
         if profit_growth:
             conditions["profit_growth"] = profit_growth
+        if industry:
+            conditions["industry"] = industry
         df = screen(conditions if conditions else None)
 
     if df is None or df.empty:

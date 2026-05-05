@@ -1,10 +1,10 @@
 import sqlite3
 import pandas as pd
-from config import DB_PATH
+import config as _config
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(_config.DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
@@ -17,6 +17,7 @@ def init_db():
             name       TEXT,
             price      REAL,
             change_pct REAL,
+            change_amt REAL,
             volume     REAL,
             amount     REAL,
             turnover   REAL,
@@ -26,6 +27,11 @@ def init_db():
             low        REAL,
             open       REAL,
             pre_close  REAL,
+            total_mv   REAL,
+            circ_mv    REAL,
+            volume_ratio REAL,
+            change_60d REAL,
+            change_ytd REAL,
             update_time TEXT DEFAULT (datetime('now','localtime'))
         );
 
@@ -94,6 +100,20 @@ def init_db():
             PRIMARY KEY (code, report_date, report_type)
         );
     """)
+    # 迁移：确保新字段存在
+    cur = conn.execute("PRAGMA table_info(realtime)")
+    existing = [r[1] for r in cur.fetchall()]
+    new_cols = [
+        ("change_amt", "REAL"),
+        ("total_mv", "REAL"),
+        ("circ_mv", "REAL"),
+        ("volume_ratio", "REAL"),
+        ("change_60d", "REAL"),
+        ("change_ytd", "REAL"),
+    ]
+    for col_name, col_type in new_cols:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE realtime ADD COLUMN {col_name} {col_type}")
     conn.commit()
     conn.close()
 

@@ -280,7 +280,8 @@ def _load_data(code, start, end):
 # ── 回测运行 ──────────────────────────────────────────────
 
 def run_backtest(code, strategy="sma_cross", start=None, end=None,
-                 initial_cash=100000, commission=0.0003, **strat_params):
+                 initial_cash=100000, commission=0.0003, return_equity=False,
+                 **strat_params):
     if start is None:
         start = (datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y%m%d")
     if end is None:
@@ -325,7 +326,7 @@ def run_backtest(code, strategy="sma_cross", start=None, end=None,
     mdd = max_drawdown(np.cumprod(1 + daily_rets)) * 100
     sharpe = sharpe_ratio(daily_rets)
 
-    return {
+    result = {
         "code": code,
         "strategy": strategy,
         "period": f"{df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}",
@@ -339,6 +340,12 @@ def run_backtest(code, strategy="sma_cross", start=None, end=None,
         "total_trades": total_trades,
         "win_rate_pct": round(won / total_trades * 100, 1) if total_trades else 0.0,
     }
+    if return_equity:
+        eq = initial_cash * np.cumprod(1 + daily_rets)
+        result["equity"] = eq.tolist()
+        result["equity_dates"] = [d.strftime("%Y-%m-%d") for d in
+            df.iloc[-len(eq):].index] if len(eq) <= len(df) else []
+    return result
 
 
 # ── 参数网格定义 ──────────────────────────────────────────
@@ -469,6 +476,71 @@ def portfolio_backtest(codes, strategy="sma_cross", start=None, end=None,
         "total_trades": total_trades,
         "win_rate_pct": round(won / total_trades * 100, 1) if total_trades else 0.0,
     }
+
+
+# ── 滚动窗口回测 ────────────────────────────────────────
+
+def rolling_backtest(code, strategy="sma_cross", start=None, end=None,
+                     train_years=2, test_months=3, initial_cash=100000,
+                     commission=0.0003, **strat_params):
+    """滚动窗口回测：用前 N 年数据训练/选参，后 M 月样本外测试。
+    返回 DataFrame，每行是一个窗口的测试结果。
+    """
+    import datetime as dt
+
+    if start is None:
+        start = (dt.date.today() - dt.timedelta(days=5*365)).strftime("%Y%m%d")
+    if end is None:
+        end = dt.date.today().strftime("%Y%m%d")
+
+    start_d = dt.date(int(start[:4]), int(start[4:6]), int(start[6:]))
+    end_d = dt.date(int(end[:4]), int(end[4:6]), int(end[6:]))
+
+    windows = []
+    # 滚动生成窗口
+    train_start = start_d
+    while True:
+        train_end = train_start + dt.timedelta(days=int(train_years * 365))
+        test_start = train_end
+        test_end = test_start + dt.timedelta(days=int(test_months * 30))
+        if test_end > end_d:
+            break
+        # 在训练集上优化参数
+        best_params, _, _ = optimize_backtest(
+            code, strategy,
+            train_start.strftime("%Y%m%d"), train_end.strftime("%Y%m%d"),
+            initial_cash, metric="sharpe_ratio",
+        )
+        # 在测试集上用最优参数回测
+        r = run_backtest(
+            code, strategy,
+            test_start.strftime("%Y%m%d"), test_end.strftime("%Y%m%d"),
+            initial_cash, commission, **best_params,
+        )
+        # 测试集买入持有基准
+        bench = run_backtest(
+            code, "buy_hold",
+            test_start.strftime("%Y%m%d"), test_end.strftime("%Y%m%d"),
+            initial_cash, commission,
+        )
+
+        windows.append({
+            "train_period": f"{train_start.strftime('%Y%m%d')}-{train_end.strftime('%Y%m%d')}",
+            "test_period": f"{test_start.strftime('%Y%m%d')}-{test_end.strftime('%Y%m%d')}",
+            "best_params": best_params,
+            "strategy_return": r["total_return_pct"],
+            "buy_hold_return": bench["total_return_pct"],
+            "excess_return": round(r["total_return_pct"] - bench["total_return_pct"], 2),
+            "strategy_sharpe": r["sharpe_ratio"],
+            "strategy_mdd": r["max_drawdown_pct"],
+            "trades": r["total_trades"],
+        })
+        train_start += dt.timedelta(days=int(test_months * 30))
+
+    if not windows:
+        raise ValueError(f"数据不足以滚动回测，需要更长的历史区间")
+
+    return windows
 
 
 # ── 基准对比 ──────────────────────────────────────────────
