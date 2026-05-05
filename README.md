@@ -174,6 +174,12 @@ python main.py screen --rank --top 30
 # 交易建议（买入价 / 止盈价 / 止损价）
 python main.py advice --code 000559
 
+# 交易（模拟 + 实盘记录）
+python main.py scan --codes "000559,600519"
+python main.py sim start --cash 500000 && python main.py sim order --code 000559 --direction buy --quantity 1000
+python main.py trade --code 000559 --action buy --price 16.50 --quantity 100
+python main.py position
+
 # 启动可视化看板
 python main.py dashboard
 ```
@@ -193,7 +199,7 @@ python main.py dashboard
 
 ```
 stock/
-├── main.py              # CLI 入口（17 个命令）
+├── main.py              # CLI 入口（20+ 个命令）
 ├── config.py            # 路径配置 + Windows 编码修复
 ├── database.py          # SQLite 读写
 ├── exporters.py         # CSV/Excel 导出
@@ -212,6 +218,10 @@ stock/
 │   └── signal.py        # 交易建议（买/止盈/止损）
 ├── fetchers/
 │   └── industry.py      # 东方财富行业分类
+├── trading/             # 交易层
+│   ├── portfolio.py     # 实盘持仓记录+盈亏跟踪
+│   ├── signal_engine.py # 批量信号扫描(买入/卖出/观望)
+│   └── sim_account.py   # 模拟账户(下单/自动撮合/持仓)
 ├── dashboard/
 │   └── app.py           # Streamlit 看板（6 个 Tab）
 ├── data/                # SQLite 数据库
@@ -389,6 +399,72 @@ stock/
 
 输出：策略 vs 买入持有的收益/夏普/回撤三列对比 + 超额收益。
 
+### `rolling` — 滚动窗口回测
+
+| 参数 | 类型 | 可选值 | 默认值 | 说明 |
+|------|------|--------|--------|------|
+| `--code` | `string` | — | 必填 | 股票代码 |
+| `--strategy` | `enum` | 10 种有参策略 | `sma_cross` | 策略名称 |
+| `--start` | `string` | `YYYYMMDD` | `20200101` | 起始日期 |
+| `--end` | `string` | `YYYYMMDD` | 今天 | 结束日期 |
+| `--train-years` | `int` | — | `2` | 训练窗口年数（用于参数优化） |
+| `--test-months` | `int` | — | `3` | 测试窗口月数（样本外） |
+| `--cash` | `int` | — | `100000` | 初始资金 |
+
+输出：每个窗口的训练/测试区间，策略收益/基准收益/超额/夏普，汇总跑赢率和平均超额。
+
+### `industry` — 行业分类
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--save/--no-save` | `bool` | 是否保存到 SQLite，默认 `--save` |
+
+输出：股票数 + 行业数。数据用于 `screen --industry 白酒` 等行业筛选。
+
+### `scan` — 信号扫描
+
+| 参数 | 类型 | 可选值 | 默认值 | 说明 |
+|------|------|--------|--------|------|
+| `--codes` | `string` | 逗号分隔 | 持仓+实时行情前20 | 股票池 |
+| `--strategy` | `string` | 14 种策略 | `macd` | 参考策略 |
+| `--top` | `int` | — | `10` | 显示前 N 条信号 |
+
+输出：🟢买入/🔴卖出/🟡观望，含趋势/信心/盈亏比/建议价位/理由。
+
+### `position` — 持仓查询
+
+无参数。输出：交易概览（累计/胜率/盈亏）+ 持仓明细（每只盈亏）。
+
+### `trade` — 记录交易
+
+| 参数 | 类型 | 可选值 | 默认值 | 说明 |
+|------|------|--------|--------|------|
+| `--code` | `string` | — | 必填 | 股票代码 |
+| `--action` | `enum` | `buy` `sell` | 必填 | 买卖方向 |
+| `--price` | `float` | — | 必填 | 成交价 |
+| `--quantity` | `int` | — | `100` | 数量（股） |
+| `--stop-loss` | `float` | — | 无 | 止损价（买入时） |
+| `--take-profit` | `float` | — | 无 | 止盈价（买入时） |
+
+### `sim` — 模拟交易（命令组）
+
+```bash
+python main.py sim start --cash 500000           # 初始化模拟账户
+python main.py sim status                         # 账户概览+持仓明细
+python main.py sim order --code 000559 --direction buy --quantity 1000              # 市价单
+python main.py sim order --code 000559 --direction buy --quantity 100 --order-type limit --price 15.50  # 限价单
+python main.py sim eod                             # 日终撮合所有 pending 限价单
+```
+
+| 子命令 | 关键参数 | 说明 |
+|--------|---------|------|
+| `start` | `--cash` | 初始资金（默认 10 万） |
+| `status` | — | 账户概览：总资产/现金/市值/盈亏/收益率 |
+| `order` | `--code` `--direction` `--quantity` `--order-type` `--price` | 下单。市价单立即成交；限价单需填 --price，待撮合 |
+| `orders` | `--type` (pending/filled/cancelled) | 查看订单列表，待成交订单带撤单提示 |
+| `cancel` | `--id` | 撤单（仅 pending 状态可撤） |
+| `eod` | — | 用最新行情撮合所有 pending 限价单 |
+
 ### 仓位管理（`analytics/position.py`）
 
 | 函数 | 逻辑 |
@@ -523,6 +599,7 @@ python main.py dashboard
 #   Tab 4 因子分析 — 因子值曲线 + IC 分析
 #   Tab 5 股票筛选 — 条件/模板/多因子排名（自动过滤 ST）
 #   Tab 6 交易建议 — 买入/止盈/止损 + 盈亏比
+#   Tab 7 持仓交易 — 模拟账户(下单/撮合/持仓) + 实盘记录 + 信号扫描
 #   侧边栏     — 代码+名称搜索 + 股票卡片(价/市值/PE/PB/换手) + 一键数据抓取
 ```
 

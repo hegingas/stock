@@ -15,6 +15,7 @@ from analytics import (
     calc_factor, factor_ic, screen, get_advice,
 )
 from fetchers import HistoryFetcher, FinancialFetcher, FundFlowFetcher, RealtimeFetcher
+from trading import scan_signals, Portfolio, SimAccount
 
 st.set_page_config(
     page_title="A股量化看板", page_icon="📊",
@@ -238,9 +239,9 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"失败: {e}")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📈 行情总览", "📋 个股详情", "⚡ 策略回测",
-    "🔬 因子分析", "🔍 股票筛选", "💡 交易建议",
+    "🔬 因子分析", "🔍 股票筛选", "💡 交易建议", "💰 持仓交易",
 ])
 
 # ── 配色常量 ──────────────────────────────────────────────
@@ -993,3 +994,203 @@ with tab6:
                 st.caption("📝 分析理由")
                 for r in result["reasons"]:
                     st.write(f"· {r}")
+
+
+# ── Tab 7: 持仓交易 ──────────────────────────────────────
+with tab7:
+    sim_acc = SimAccount()
+
+    # ── 模拟交易面板 ──────────────────────────────
+    with st.expander("🤖 模拟交易账户", expanded=True):
+        sim_sum = sim_acc.get_summary()
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("总资产", f"{sim_sum['total_value']:,.0f}")
+        c2.metric("可用现金", f"{sim_sum['cash']:,.0f}")
+        c3.metric("持仓市值", f"{sim_sum['market_value']:,.0f}")
+        c4.metric("浮动盈亏", f"{sim_sum['total_pnl']:+,.0f}")
+        c5.metric("总收益率", f"{sim_sum['total_return']:+.2f}%")
+        c6.metric("持仓数", sim_sum["positions"])
+
+        # 快速下单
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            sim_dir = st.selectbox("方向", ["buy", "sell"], format_func=lambda x: "🟢买入" if x=="buy" else "🔴卖出", key="sim_dir")
+        with c2:
+            sim_code = st.text_input("代码", value=code, key="sim_code2")
+        with c3:
+            sim_qty = st.number_input("数量(股)", 100, 100000, 100, 100, key="sim_qty")
+        with c4:
+            sim_type = st.selectbox("类型", ["market", "limit"], key="sim_type")
+
+        sim_price = None
+        if sim_type == "limit":
+            sim_price = st.number_input("限价", value=0.0, step=0.01, format="%.2f", key="sim_price")
+
+        c_btn1, c_btn2 = st.columns(2)
+        with c_btn1:
+            if st.button("📝 提交模拟订单", type="primary", use_container_width=True):
+                price = None if sim_type == "market" else (sim_price if sim_price > 0 else None)
+                if sim_type == "limit" and not price:
+                    st.error("请输入有效的限价")
+                else:
+                    r = sim_acc.submit_order(sim_code, sim_dir, sim_qty, sim_type, price)
+                if "error" in r:
+                    st.error(r["error"])
+                else:
+                    st.success(f"✅ {r.get('status','')}")
+                    st.rerun()
+        with c_btn2:
+            if st.button("🧪 测试挂单(限价15.00)", use_container_width=True,
+                         help=f"提交{code}限价买单@15.00，不会立即成交"):
+                r = sim_acc.submit_order(code, "buy", 100, "limit", 15.00)
+                if "error" in r:
+                    st.error(r["error"])
+                else:
+                    st.success(f"✅ 挂单已提交 — 去下方订单列表撤单试试")
+                    st.rerun()
+
+        # 日终撮合按钮
+        c1, c2 = st.columns([1, 5])
+        with c1:
+            if st.button("⚡ 日终撮合"):
+                sim_acc.process_eod()
+                st.success("撮合完成")
+                st.rerun()
+        # 模拟持仓
+        sim_pos = sim_acc.get_positions()
+        if not sim_pos.empty:
+            st.subheader("模拟持仓")
+            show_cols = ["code", "name", "avg_cost", "current_price", "quantity", "pnl", "pnl_pct"]
+            available = [c for c in show_cols if c in sim_pos.columns]
+            st.dataframe(sim_pos[available], width="stretch", hide_index=True)
+
+    # 订单列表
+    pending_cnt = len(sim_acc.get_orders("pending"))
+    st.subheader(f"📋 模拟订单 {'🔴 '+str(pending_cnt)+'笔待成交' if pending_cnt else ''}")
+    sim_orders = sim_acc.get_orders(limit=20)
+    if not sim_orders.empty:
+        for _, o in sim_orders.iterrows():
+            icon = {"pending": "⏳", "filled": "✅", "cancelled": "✕"}.get(o["status"], "?")
+            c1, c2 = st.columns([6, 1])
+            with c1:
+                fp = o.get("fill_price") or 0
+                st.caption(f"{icon} #{int(o['id'])} {o['code']} {o['direction']} "
+                           f"{int(o['quantity'])}股 @{o.get('price',0):.2f} "
+                           f"状态:{o['status']}"
+                           f"{' 成交价:'+str(fp) if o['status']=='filled' else ''}")
+            with c2:
+                if o["status"] == "pending":
+                    if st.button("✕", key=f"cx_{int(o['id'])}", help="撤单"):
+                        sim_acc.cancel_order(int(o['id']))
+                        st.rerun()
+    else:
+        st.caption("无订单")
+
+    st.markdown("---")
+
+    # ── 实盘记录面板 ──────────────────────────────
+    pf = Portfolio()
+    summary = pf.get_summary()
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("累计交易", f"{summary['total_trades']} 笔")
+    c2.metric("胜率", f"{summary['win_rate']}%")
+    c3.metric("已实现盈亏", f"{summary['total_pnl']:+,.2f}")
+    c4.metric("未实现盈亏", f"{summary['unrealized_pnl']:+,.2f}")
+    c5.metric("当前持仓", f"{summary['open_positions']} 只")
+
+    st.markdown("---")
+
+    # 记录交易
+    with st.expander("📝 记录交易", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            trade_action = st.selectbox("方向", ["buy", "sell"], format_func=lambda x: "🟢 买入" if x == "buy" else "🔴 卖出")
+        with c2:
+            trade_code = st.text_input("代码", value=code, key="trade_code")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            trade_price = st.number_input("价格", value=0.0, step=0.01, format="%.2f", key="trade_price")
+        with c2:
+            trade_qty = st.number_input("数量(股)", value=100, step=100, key="trade_qty")
+        with c3:
+            trade_sl = st.number_input("止损价(买入时)", value=0.0, step=0.01, format="%.2f", key="trade_sl")
+
+        if st.button("✅ 确认记录", type="primary"):
+            if trade_price <= 0:
+                st.error("请输入有效价格")
+            else:
+                if trade_action == "buy":
+                    from database import query as _q
+                    name = trade_code
+                    rt = _q("SELECT name FROM realtime WHERE code=?", [trade_code])
+                    if not rt.empty:
+                        name = rt.iloc[0]["name"]
+                    pf.open_position(trade_code, name, trade_price, trade_qty,
+                                     trade_sl if trade_sl > 0 else None,
+                                     None)
+                    st.success(f"买入 {trade_code} {name} {trade_price:.2f}×{trade_qty}")
+                else:
+                    r = pf.close_position(trade_code, trade_price)
+                    if r:
+                        st.success(f"卖出 {trade_code} 盈亏: {r['pnl']:+,.2f} ({r['pnl_pct']:+.2f}%) 持有{r['hold_days']}天")
+                    else:
+                        st.error(f"{trade_code} 不在持仓中")
+                st.rerun()
+
+    # 当前持仓
+    st.subheader("📋 当前持仓")
+    positions = pf.get_positions()
+    if not positions.empty:
+        show_cols = ["code", "name", "buy_date", "buy_price", "current_price",
+                     "quantity", "pnl", "pnl_pct", "stop_loss"]
+        available = [c for c in show_cols if c in positions.columns]
+        st.dataframe(positions[available], width="stretch", hide_index=True,
+            column_config={
+                "pnl": st.column_config.NumberColumn("盈亏", format="%+.2f"),
+                "pnl_pct": st.column_config.NumberColumn("盈亏%", format="%+.2f%%"),
+            })
+    else:
+        st.info("暂无持仓")
+
+    # 历史交易
+    st.markdown("---")
+    st.subheader("📜 历史交易")
+    trades = pf.get_trades(30)
+    if not trades.empty:
+        st.dataframe(trades[["code", "name", "buy_date", "sell_date", "buy_price",
+                              "sell_price", "quantity", "pnl", "pnl_pct", "hold_days"]],
+                      width="stretch", hide_index=True,
+            column_config={
+                "pnl": st.column_config.NumberColumn("盈亏", format="%+.2f"),
+                "pnl_pct": st.column_config.NumberColumn("盈亏%", format="%+.2f%%"),
+            })
+    else:
+        st.info("暂无历史交易")
+
+    # 信号扫描
+    st.markdown("---")
+    st.subheader("🔍 信号扫描")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        scan_strat = st.selectbox("策略", ["macd", "sma_cross", "cci", "kdj", "mean_revert"], key="scan_strat")
+    if st.button("🔍 扫描信号", type="primary"):
+        codes = []
+        if not positions.empty:
+            codes = positions["code"].tolist()
+        # 补充关注列表
+        from database import query as _q2
+        rt = _q2("SELECT code FROM realtime WHERE turnover>3 AND pe>0 LIMIT 30")
+        for c in rt["code"].tolist():
+            if c not in codes:
+                codes.append(c)
+
+        with st.spinner(f"扫描 {len(codes)} 只..."):
+            df_sig = scan_signals(codes[:30], strategy=scan_strat, top=15)
+            if not df_sig.empty:
+                for _, r in df_sig.iterrows():
+                    icon = {"buy": "🟢", "sell": "🔴", "hold": "🟡"}.get(r["signal"], "?")
+                    st.write(f"{icon} **{r['code']} {r['name']}** {r['price']:.2f} | "
+                             f"趋势:{r['trend']} | 盈亏比:{r['risk_reward']}:1 | {r['reason']}")
+            else:
+                st.info("无信号")

@@ -12,6 +12,7 @@ from analytics import (
     breakout_screen, oversold_screen, growth_screen, get_advice,
 )
 from analytics.backtest import PARAM_GRIDS
+from trading import scan_signals, Portfolio, SimAccount
 
 logging.basicConfig(
     level=logging.INFO,
@@ -581,6 +582,212 @@ def advice(code):
     for reason in result["reasons"]:
         click.echo(f"║  · {reason}")
     click.echo("╚══════════════════════════════════════════╝")
+
+
+# ── scan ──────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--codes", default=None, help="股票代码逗号分隔，默认取持仓+关注列表")
+@click.option("--strategy", "strat", default="macd", help="参考策略")
+@click.option("--top", default=10, help="显示前 N 条信号")
+def scan(codes, strat, top):
+    """扫描信号 — 对关注列表生成买卖建议"""
+    if codes:
+        code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    else:
+        # 默认取实时行情前 20 只 + 当前持仓
+        from database import query, table_exists
+        code_list = []
+        if table_exists("realtime"):
+            df = query("SELECT code FROM realtime LIMIT 20")
+            code_list = df["code"].tolist() if not df.empty else []
+        if table_exists("positions"):
+            df = query("SELECT code FROM positions")
+            for c in df["code"].tolist():
+                if c not in code_list:
+                    code_list.append(c)
+
+    click.echo(f"\n🔍 扫描 {len(code_list)} 只股票（策略={strat}）...")
+    df = scan_signals(code_list, strategy=strat, top=top)
+
+    if df.empty:
+        click.echo("无信号")
+        return
+
+    for _, r in df.iterrows():
+        icon = {"buy": "🟢 买入", "sell": "🔴 卖出", "hold": "🟡 观望"}.get(r["signal"], "?")
+        click.echo(f"\n{icon} {r['code']} {r['name']}  {r['price']:.2f}")
+        click.echo(f"   趋势: {r['trend']} | 信心: {r['confidence']} | 盈亏比: {r['risk_reward']}:1")
+        click.echo(f"   建议买 {r['buy_price']:.2f} / 止盈 {r['take_profit']:.2f} / 止损 {r['stop_loss']:.2f}")
+        click.echo(f"   理由: {r['reason']}")
+
+
+# ── position ──────────────────────────────────────────────
+
+@cli.command()
+def position():
+    """查看当前持仓"""
+    pf = Portfolio()
+    summary = pf.get_summary()
+    positions = pf.get_positions()
+
+    click.echo(f"\n📊 交易概览")
+    click.echo(f"   累计交易: {summary['total_trades']} 笔")
+    click.echo(f"   胜率:     {summary['win_rate']}%")
+    click.echo(f"   已实现盈亏: {summary['total_pnl']:+,.2f}")
+    click.echo(f"   未实现盈亏: {summary['unrealized_pnl']:+,.2f}")
+    click.echo(f"   当前持仓: {summary['open_positions']} 只")
+
+    if not positions.empty:
+        click.echo(f"\n{'代码':<8} {'名称':<10} {'买入价':>8} {'现价':>8} {'数量':>6} {'盈亏':>10} {'盈亏%':>8}")
+        click.echo("-" * 64)
+        for _, p in positions.iterrows():
+            pnl = p.get("pnl", 0) or 0
+            pnl_pct = p.get("pnl_pct", 0) or 0
+            cp = p.get("current_price", 0) or 0
+            click.echo(f"{p['code']:<8} {p['name']:<10} {p['buy_price']:>8.2f} {cp:>8.2f} "
+                       f"{int(p['quantity']):>6} {pnl:>+10.2f} {pnl_pct:>+8.2f}%")
+
+
+# ── trade ─────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--code", required=True, help="股票代码")
+@click.option("--action", type=click.Choice(["buy", "sell"]), required=True, help="买卖方向")
+@click.option("--price", type=float, required=True, help="成交价")
+@click.option("--quantity", type=int, default=100, help="数量(股)")
+@click.option("--stop-loss", type=float, default=None, help="止损价(买入时)")
+@click.option("--take-profit", type=float, default=None, help="止盈价(买入时)")
+def trade_cmd(code, action, price, quantity, stop_loss, take_profit):
+    """记录交易（买入/卖出）"""
+    pf = Portfolio()
+
+    if action == "buy":
+        from database import query
+        name = code
+        rt = query("SELECT name FROM realtime WHERE code=?", [code])
+        if not rt.empty:
+            name = rt.iloc[0]["name"]
+        pf.open_position(code, name, price, quantity, stop_loss, take_profit)
+        click.echo(f"✅ 买入 {code} {name} {price:.2f}×{quantity}股")
+        if stop_loss:
+            click.echo(f"   止损: {stop_loss:.2f}  止盈: {take_profit or '--'}")
+    else:
+        result = pf.close_position(code, price)
+        if result:
+            click.echo(f"✅ 卖出 {code} 盈亏: {result['pnl']:+,.2f} ({result['pnl_pct']:+.2f}%) "
+                       f"持有 {result['hold_days']} 天")
+        else:
+            click.echo(f"⚠️ {code} 不在持仓中")
+
+
+# ── sim ───────────────────────────────────────────────────
+
+@cli.group()
+def sim():
+    """模拟交易账户管理"""
+    pass
+
+
+@sim.command()
+@click.option("--cash", default=100000, help="初始资金")
+def start(cash):
+    """初始化模拟账户"""
+    acc = SimAccount()
+    acc.reset(cash)
+    click.echo(f"✅ 模拟账户已初始化，初始资金: {cash:,.0f}")
+
+
+@sim.command()
+def status():
+    """模拟账户状态"""
+    acc = SimAccount()
+    s = acc.get_summary()
+    click.echo(f"""
+╔══════════════════════════════════╗
+║  📊 模拟账户状态
+╠══════════════════════════════════╣
+║  初始资金: {s['initial_cash']:>16,.0f}
+║  可用现金: {s['cash']:>16,.2f}
+║  持仓市值: {s['market_value']:>16,.2f}
+║  总资产:   {s['total_value']:>16,.2f}
+║  浮动盈亏: {s['total_pnl']:>+16,.2f}
+║  总收益率: {s['total_return']:>+15.2f}%
+║  持仓数:   {s['positions']:>16}
+╚══════════════════════════════════╝
+""")
+
+    positions = acc.get_positions()
+    if not positions.empty:
+        click.echo("持仓明细:")
+        click.echo(f"{'代码':<8} {'名称':<10} {'成本':>8} {'现价':>8} {'数量':>6} {'盈亏':>10}")
+        for _, p in positions.iterrows():
+            click.echo(f"{p['code']:<8} {p['name']:<10} {p['avg_cost']:>8.2f} "
+                       f"{p.get('current_price',0) or 0:>8.2f} {int(p['quantity']):>6} "
+                       f"{(p.get('pnl',0) or 0):>+10.2f}")
+
+
+@sim.command()
+@click.option("--code", required=True, help="股票代码")
+@click.option("--direction", type=click.Choice(["buy", "sell"]), required=True)
+@click.option("--quantity", type=int, required=True)
+@click.option("--order-type", type=click.Choice(["market", "limit"]), default="market")
+@click.option("--price", type=float, default=None, help="限价（limit类型必填）")
+def order(code, direction, quantity, order_type, price):
+    """提交模拟订单"""
+    if order_type == "limit" and not price:
+        click.echo("❌ 限价单需要指定 --price")
+        return
+    acc = SimAccount()
+    result = acc.submit_order(code, direction, quantity, order_type, price)
+    if "error" in result:
+        click.echo(f"❌ {result['error']}")
+    else:
+        click.echo(f"✅ 订单已提交: {direction} {code} {quantity}股 "
+                   f"({'市价' if order_type=='market' else f'限价{price}'}) "
+                   f"状态: {result.get('status','')}")
+
+
+@sim.command()
+@click.option("--type", "status_filter", default=None,
+              type=click.Choice(["pending", "filled", "cancelled"]),
+              help="按状态筛选")
+def orders(status_filter):
+    """查看订单列表"""
+    acc = SimAccount()
+    df = acc.get_orders(status_filter)
+    if df.empty:
+        click.echo("无订单")
+        return
+    pending_n = len(df[df["status"] == "pending"]) if not df.empty else 0
+    if pending_n:
+        click.echo(f"\n⏳ {pending_n} 笔待成交 — 用 sim cancel --id <ID> 撤单")
+    click.echo(f"\n{'ID':<5} {'代码':<8} {'方向':<6} {'数量':>6} {'价格':>8} {'状态':<10} {'成交价':>8}")
+    click.echo("-" * 60)
+    for _, o in df.iterrows():
+        fp = o.get("fill_price") or 0
+        st = o["status"]
+        icon = {"pending": "⏳", "filled": "✅", "cancelled": "✕"}.get(st, "?")
+        hint = " ← sim cancel --id " + str(int(o['id'])) if st == "pending" else ""
+        click.echo(f"{int(o['id']):<5} {o['code']:<8} {o['direction']:<6} {int(o['quantity']):>6} "
+                   f"{o.get('price') or 0:>8.2f} {icon}{st:<9} {fp:>8.2f}{hint}")
+
+
+@sim.command()
+@click.option("--id", "order_id", type=int, required=True, help="订单ID")
+def cancel(order_id):
+    """撤单 — 取消 pending 状态的订单"""
+    acc = SimAccount()
+    acc.cancel_order(order_id)
+    click.echo(f"✅ 订单 {order_id} 已取消")
+
+
+@sim.command()
+def eod():
+    """日终处理 — 撮合所有pending限价单"""
+    acc = SimAccount()
+    acc.process_eod()
+    click.echo("✅ 日终撮合完成")
 
 
 # ── status ────────────────────────────────────────────────

@@ -29,6 +29,17 @@ python main.py screen --template breakout                  # 模板筛选
 python main.py screen --rank --top 30                      # 多因子排名
 python main.py advice --code 000559                        # 交易建议（买入/止盈/止损）
 
+# 交易
+python main.py scan --codes "000559,600519"                 # 扫描信号（买入/卖出/观望）
+python main.py position                                     # 查看持仓+盈亏
+python main.py trade --code 000559 --action buy --price 16.50 --quantity 100  # 记录交易
+python main.py sim start --cash 500000                      # 初始化模拟账户
+python main.py sim order --code 000559 --direction buy --quantity 1000  # 模拟下单
+python main.py sim order --code 000559 --direction buy --quantity 100 --order-type limit --price 15.00  # 限价单
+python main.py sim orders --type pending                    # 查看待成交订单
+python main.py sim cancel --id 3                            # 撤单
+python main.py sim status                                   # 模拟账户状态
+
 # 看板与工具
 python main.py dashboard                   # 启动 Streamlit 看板
 python main.py export --table realtime --format csv         # 导出 CSV/Excel
@@ -40,7 +51,7 @@ python -m pytest tests/ -v                 # 67 tests
 
 ## Architecture
 
-**Six layers:** CLI (`main.py`, 17 commands) → Dashboard (`dashboard/app.py`, 6 tabs) → Analytics (`analytics/`, 6 modules) → Fetchers (`fetchers/`, 5 fetchers) → Persistence (`database.py`, SQLite WAL) → Export (`exporters.py`, CSV/Excel).
+**Seven layers:** CLI (`main.py`, 20+ commands) → Dashboard (`dashboard/app.py`, 7 tabs) → Trading (`trading/`, 3 modules) → Analytics (`analytics/`, 6 modules) → Fetchers (`fetchers/`, 5 fetchers) → Persistence (`database.py`, SQLite WAL) → Export (`exporters.py`, CSV/Excel).
 
 ### Analytics modules
 
@@ -52,6 +63,14 @@ python -m pytest tests/ -v                 # 67 tests
 | `position.py` | `kelly_fraction`, `volatility_sizer`, `fixed_fraction`, `equal_weight`, `adaptive_sizer` | 5 position sizing methods |
 | `metrics.py` | `sharpe_ratio`, `max_drawdown`, `annual_return`, `win_rate`, `profit_loss_ratio`, `calmar_ratio` | Pure functions |
 | `signal.py` | `get_advice` | Buy/stop-loss/take-profit via Bollinger+ATR+MA |
+
+### Trading modules
+
+| Module | Key exports | Purpose |
+|--------|------------|---------|
+| `portfolio.py` | `Portfolio` | Manual trade recording: positions, trade history, P&L summary. Tables: `positions`(code/buy_price/qty/sl/tp), `trades`(buy/sell/pnl/hold_days) |
+| `signal_engine.py` | `scan_signals` | Batch scan stocks → buy/sell/hold signals based on advice + backtest results |
+| `sim_account.py` | `SimAccount` | Simulated trading: cash/positions/orders with auto-fill. Market orders fill immediately at realtime price; limit orders fill via `process_eod()` when price crosses. Tables: `sim_account`, `sim_orders`, `sim_positions`, `sim_trades` |
 
 ### Fetchers
 
@@ -90,6 +109,7 @@ python -m pytest tests/ -v                 # 67 tests
 - **Tab 4** — factor: line chart + IC metrics
 - **Tab 5** — screener: condition/template/ranking modes, industry filter
 - **Tab 6** — advice: buy/take-profit/stop-loss + confidence
+- **Tab 7** — trading: simulated account (order/position/P&L) + manual trade recording + signal scanning
 - **Sidebar** — fuzzy search (code/name) + one-click data fetch + stock card (price/change/market-cap/PE/PB/turnover)
 
 ### Key design decisions
