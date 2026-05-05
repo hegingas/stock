@@ -118,6 +118,16 @@ def query(sql, params=None):
         conn.close()
 
 
+def clear_code(table_name, code):
+    """删除指定表中某只股票的所有记录。"""
+    conn = get_conn()
+    try:
+        conn.execute(f"DELETE FROM {table_name} WHERE code=?", [code])
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def table_exists(table_name):
     conn = get_conn()
     try:
