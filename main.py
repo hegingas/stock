@@ -5,6 +5,11 @@ from exporters import export
 from fetchers import (
     RealtimeFetcher, HistoryFetcher, FinancialFetcher, FundFlowFetcher
 )
+from analytics import (
+    run_backtest, calc_factor, factor_ic, screen, rank_screen,
+    value_screen, momentum_screen, quality_screen,
+    breakout_screen, oversold_screen, growth_screen, get_advice,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,6 +199,214 @@ def export_cmd(table, fmt, output, code, date):
         export(table, fmt=fmt, output_path=output, **filters)
     except ValueError as e:
         click.echo(f"错误: {e}")
+
+
+# ── backtest ─────────────────────────────────────────────
+
+@cli.command()
+@click.option("--code", required=True, help="股票代码")
+@click.option("--strategy", "strat", default="sma_cross",
+              type=click.Choice(["sma_cross", "rsi", "buy_hold", "macd", "bollinger", "ma_align", "turtle", "vol_breakout", "mean_revert", "kdj", "cci", "williams_r", "donchian", "three_bar"]),
+              help="策略名称")
+@click.option("--start", default=None, help="起始日期 YYYYMMDD（默认一年前）")
+@click.option("--end", default=None, help="结束日期 YYYYMMDD（默认今天）")
+@click.option("--cash", default=100000, help="初始资金")
+def backtest(code, strat, start, end, cash):
+    """运行策略回测"""
+    try:
+        result = run_backtest(code, strategy=strat, start=start, end=end,
+                              initial_cash=int(cash))
+    except ValueError as e:
+        click.echo(f"错误: {e}")
+        return
+
+    click.echo(f"\n{'='*50}")
+    click.echo(f"  回测结果: {result['code']}  {result['strategy']}")
+    click.echo(f"{'='*50}")
+    click.echo(f"  回测区间: {result['period']}")
+    click.echo(f"  交易日数: {result['trading_days']}")
+    click.echo(f"  初始资金: {result['initial_cash']:,.0f}")
+    click.echo(f"  最终资金: {result['final_value']:,.0f}")
+    click.echo(f"  总收益率: {result['total_return_pct']}%")
+    click.echo(f"  年化收益: {result['annual_return_pct']}%")
+    click.echo(f"  最大回撤: {result['max_drawdown_pct']}%")
+    click.echo(f"  夏普比率: {result['sharpe_ratio']}")
+    click.echo(f"  交易次数: {result['total_trades']}")
+    click.echo(f"  胜率:     {result['win_rate_pct']}%")
+
+
+# ── factor ────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--code", required=True, help="股票代码")
+@click.option("--name", "factor_name", default="momentum",
+              type=click.Choice(["momentum", "volatility", "turnover", "volume_ratio"]),
+              help="因子名称")
+@click.option("--period", default=20, help="计算周期")
+@click.option("--ic", is_flag=True, help="同时计算 IC 分析")
+def factor(code, factor_name, period, ic):
+    """计算因子值"""
+    fname_map = {
+        "momentum": "动量", "volatility": "波动率",
+        "turnover": "换手率", "volume_ratio": "量比"
+    }
+    df = calc_factor(code, factor_name, period=period)
+    if df is None or df.empty:
+        click.echo("因子计算失败，数据不足")
+        return
+
+    name_cn = fname_map.get(factor_name, factor_name)
+    click.echo(f"\n{code} {name_cn}因子（最近10个交易日）")
+    click.echo(df.tail(10).to_string(index=False))
+
+    if ic:
+        result = factor_ic(code, factor_name, forward_period=5, period=period)
+        if "error" not in result:
+            click.echo(f"\nIC 分析（前向5日收益）:")
+            click.echo(f"  IC 均值:   {result['ic_mean']}")
+            click.echo(f"  IC 标准差: {result['ic_std']}")
+            click.echo(f"  IC_IR:     {result['ic_ir']}")
+            click.echo(f"  IC 胜率:   {result['ic_win_rate']}")
+            click.echo(f"  数据点:    {result['data_points']}")
+
+
+# ── screen ────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--pe-max", default=None, type=float, help="PE 上限")
+@click.option("--pe-min", default=None, type=float, help="PE 下限（排除亏损）")
+@click.option("--pb-max", default=None, type=float, help="PB 上限")
+@click.option("--change-min", default=None, type=float, help="涨跌幅下限(%)")
+@click.option("--change-max", default=None, type=float, help="涨跌幅上限(%)")
+@click.option("--turnover-min", default=None, type=float, help="换手率下限(%)")
+@click.option("--turnover-max", default=None, type=float, help="换手率上限(%)")
+@click.option("--ma-align/--no-ma-align", default=None, help="均线多头排列(MA5>MA10>MA20)")
+@click.option("--near-high", default=None, type=int, help="接近 N 日内最高价")
+@click.option("--vol-ratio-min", default=None, type=float, help="量比下限（倍）")
+@click.option("--up-days", default=None, type=str, help="近N日至少M日上涨，格式: N,M")
+@click.option("--roe-min", default=None, type=float, help="ROE 下限(%，从财报计算)")
+@click.option("--revenue-growth", default=None, type=float, help="营收增速下限(%)")
+@click.option("--profit-growth", default=None, type=float, help="利润增速下限(%)")
+@click.option("--template", "tpl", default=None,
+              type=click.Choice(["value", "momentum", "quality", "breakout", "oversold", "growth"]),
+              help="预置筛选模板")
+@click.option("--rank", "do_rank", is_flag=True, help="多因子打分排名模式")
+@click.option("--top", default=20, help="显示前 N 条")
+def screen_cmd(pe_max, pe_min, pb_max, change_min, change_max, turnover_min, turnover_max,
+               ma_align, near_high, vol_ratio_min, up_days, roe_min, revenue_growth,
+               profit_growth, tpl, do_rank, top):
+    """多条件股票筛选 — 技术面 + 基本面 + 多因子打分"""
+
+    if do_rank:
+        df = rank_screen(top=top)
+        if df is not None and not df.empty:
+            click.echo(f"\n多因子打分排名 Top {len(df)}:")
+            click.echo(df.to_string(index=False))
+        else:
+            click.echo("无结果")
+        return
+
+    if tpl:
+        tpl_map = {
+            "value": value_screen,
+            "momentum": momentum_screen,
+            "quality": quality_screen,
+            "breakout": breakout_screen,
+            "oversold": oversold_screen,
+            "growth": growth_screen,
+        }
+        fn = tpl_map[tpl]
+        df = fn(top=top) if tpl in ("breakout", "oversold", "growth") else fn()
+    else:
+        conditions = {}
+        if pe_max is not None:
+            conditions["pe_max"] = pe_max
+        if pe_min is not None:
+            conditions["pe_min"] = pe_min
+        if pb_max is not None:
+            conditions["pb_max"] = pb_max
+        if change_min is not None:
+            conditions["change_min"] = change_min
+        if change_max is not None:
+            conditions["change_max"] = change_max
+        if turnover_min is not None:
+            conditions["turnover_min"] = turnover_min
+        if turnover_max is not None:
+            conditions["turnover_max"] = turnover_max
+        if ma_align:
+            conditions["ma_align"] = True
+        if near_high:
+            conditions["near_high"] = near_high
+        if vol_ratio_min:
+            conditions["vol_ratio_min"] = vol_ratio_min
+        if up_days:
+            conditions["up_days"] = up_days
+        if roe_min:
+            conditions["roe_min"] = roe_min
+        if revenue_growth:
+            conditions["revenue_growth"] = revenue_growth
+        if profit_growth:
+            conditions["profit_growth"] = profit_growth
+        df = screen(conditions if conditions else None)
+
+    if df is None or df.empty:
+        click.echo("无符合条件的股票")
+        return
+
+    click.echo(f"\n筛选结果: {len(df)} 只（显示前 {min(top, len(df))} 只）")
+    show_cols = ["code", "name", "price", "change_pct", "pe", "pb", "turnover"]
+    available = [c for c in show_cols if c in df.columns]
+    click.echo(df[available].head(top).to_string(index=False))
+
+
+# ── dashboard ─────────────────────────────────────────────
+
+@cli.command()
+def dashboard():
+    """启动 Streamlit 可视化看板"""
+    import subprocess
+    import sys
+    import os
+    app_path = os.path.join(os.path.dirname(__file__), "dashboard", "app.py")
+    subprocess.run([sys.executable, "-m", "streamlit", "run", app_path])
+
+
+# ── advice ────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--code", required=True, help="股票代码")
+def advice(code):
+    """获取交易建议（买入价/止盈价/止损价）"""
+    result = get_advice(code)
+    if "error" in result:
+        click.echo(f"错误: {result['error']}")
+        return
+
+    confidence_color = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+    conf = result["confidence"]
+
+    click.echo(f"""
+╔══════════════════════════════════════════╗
+║  {result['code']} {result['name']}  交易建议
+╠══════════════════════════════════════════╣
+║  当前价格:    {result['current_price']:>10.2f} 元
+║  趋势判断:    {result['trend']:>10}
+║  信心等级:    {confidence_color.get(conf, '⚪')} {conf}
+╠══════════════════════════════════════════╣
+║  🎯 建议买入:  {result['buy_price']:>10.2f} 元
+║  🏁 止盈目标:  {result['take_profit']:>10.2f} 元
+║  🛑 止损价位:  {result['stop_loss']:>10.2f} 元
+║  📊 盈亏比:    {result['risk_reward']:>10.1f} : 1
+╠══════════════════════════════════════════╣
+║  技术指标:
+║    MA20:  {result['ma20']:>8.2f}   布林上轨: {result['bb_upper']:>8.2f}
+║    MA60:  {result['ma60']:>8.2f}   布林下轨: {result['bb_lower']:>8.2f}
+║    ATR14: {result['atr']:>8.2f}   20日高:  {result['swing_high_20']:>8.2f}
+║    20日低: {result['swing_low_20']:>8.2f}
+╠══════════════════════════════════════════╣""")
+    for reason in result["reasons"]:
+        click.echo(f"║  · {reason}")
+    click.echo("╚══════════════════════════════════════════╝")
 
 
 # ── status ────────────────────────────────────────────────
