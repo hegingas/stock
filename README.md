@@ -157,13 +157,20 @@ python main.py export --table history --format csv
 # 策略回测（14 种策略可选）
 python main.py backtest --code 000559 --strategy macd
 
+# 参数优化（网格搜索最优参数）
+python main.py optimize --code 000559 --strategy sma_cross
+
+# 组合回测 + 基准对比
+python main.py portfolio --codes "000001,600519,300750" --strategy macd
+python main.py benchmark --code 000559 --strategy cci
+
 # 因子计算 + IC 分析
 python main.py factor --code 000559 --name momentum --ic
 
-# 股票筛选（估值 / 技术面 / 基本面）
+# 股票筛选（自动过滤 ST/退市）
 python main.py screen --pe-max 20 --pb-max 2 --ma-align --top 20
-python main.py screen --template breakout             # 放量突破模板
-python main.py screen --rank --top 30                 # 多因子排名
+python main.py screen --template breakout
+python main.py screen --rank --top 30
 
 # 交易建议（买入价 / 止盈价 / 止损价）
 python main.py advice --code 000559
@@ -187,7 +194,7 @@ python main.py dashboard
 
 ```
 stock/
-├── main.py              # CLI 入口（13 个命令）
+├── main.py              # CLI 入口（16 个命令）
 ├── config.py            # 路径配置 + Windows 编码修复
 ├── database.py          # SQLite 读写
 ├── exporters.py         # CSV/Excel 导出
@@ -198,9 +205,10 @@ stock/
 │   ├── financial.py     # 财务报表
 │   └── fund_flow.py     # 资金流向 / 龙虎榜 / 北向资金
 ├── analytics/           # 量化分析层
-│   ├── backtest.py      # 回测引擎（14 种策略）
+│   ├── backtest.py      # 回测引擎（14 策略 + 参数优化 + 组合回测 + 基准对比）
 │   ├── factors.py       # 因子计算 + IC 分析
-│   ├── screener.py      # 多条件筛选 + 多因子排名
+│   ├── screener.py      # 多条件筛选 + 多因子排名（自动过滤 ST/退市）
+│   ├── position.py      # 仓位管理（Kelly/波动率/固定比例）
 │   ├── metrics.py       # 绩效指标（夏普/回撤/胜率）
 │   └── signal.py        # 交易建议（买/止盈/止损）
 ├── dashboard/
@@ -343,6 +351,53 @@ stock/
 
 输出：当前价、趋势判断、建议买入价、止盈价、止损价、盈亏比、技术指标（MA20/MA60/布林带/ATR）。
 
+### `optimize` — 参数优化
+
+| 参数 | 类型 | 可选值 | 默认值 | 说明 |
+|------|------|--------|--------|------|
+| `--code` | `string` | — | 必填 | 股票代码 |
+| `--strategy` | `enum` | 12 种可调参数策略 | `sma_cross` | 策略名称 |
+| `--start` | `string` | `YYYYMMDD` | 一年前 | 起始日期 |
+| `--end` | `string` | `YYYYMMDD` | 今天 | 结束日期 |
+| `--cash` | `int` | — | `100000` | 初始资金 |
+| `--metric` | `enum` | `sharpe_ratio` `total_return_pct` `annual_return_pct` | `sharpe_ratio` | 优化目标 |
+
+各策略搜索空间：双均线 16 组、MACD 27 组、RSI 27 组、KDJ 81 组……最大 81 组组合。
+
+### `portfolio` — 组合回测
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--codes` | `string` | 股票代码，逗号分隔（如 `000001,600519`） |
+| `--strategy` | `enum` | 策略名称，全部 14 种可选 |
+| `--start` | `string` | 起始日期 |
+| `--end` | `string` | 结束日期 |
+| `--cash` | `int` | 初始资金，默认 100000 |
+
+多股等权仓位，自动剔除无数据的股票。返回组合的总收益/年化/回撤/夏普/交易详情。
+
+### `benchmark` — 基准对比
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--code` | `string` | 股票代码 |
+| `--strategy` | `enum` | 策略名称 |
+| `--start` | `string` | 起始日期 |
+| `--end` | `string` | 结束日期 |
+| `--cash` | `int` | 初始资金 |
+
+输出：策略 vs 买入持有的收益/夏普/回撤三列对比 + 超额收益。
+
+### 仓位管理（`analytics/position.py`）
+
+| 函数 | 逻辑 |
+|------|------|
+| `kelly_fraction(win_rate, pl_ratio)` | 凯利公式：f = p - (1-p)/r |
+| `volatility_sizer(returns, max_risk)` | 波动率调整：目标最大单日亏损 |
+| `fixed_fraction(capital, risk, stop_loss)` | 固定风险比例：每笔亏 ≤ X% 本金 |
+| `equal_weight(n_stocks)` | 等权分配：1 / N |
+| `adaptive_sizer(returns, wr, plr, risk)` | 自适应：Kelly + 波动率取保守值 |
+
 ## 详细使用说明
 
 ### 场景一：首次使用 — 建立数据库
@@ -461,12 +516,13 @@ python main.py dashboard
 # → 浏览器打开 http://localhost:8501
 
 # 看板功能：
-#   Tab 1 行情总览 — 全市场涨跌分布、成交额排名、涨跌幅榜
-#   Tab 2 个股详情 — K线图（含成交量）、资金流向图、最新财报
-#   Tab 3 回测     — 选择策略 → 一键运行 → 查看收益/回撤/夏普
-#   Tab 4 因子分析 — 选择因子 → 因子值曲线 + IC 分析
-#   Tab 5 股票筛选 — 条件筛选 / 模板 / 多因子排名三种模式
-#   Tab 6 交易建议 — 一键获取买入/止盈/止损价位
+#   Tab 1 行情总览 — 涨跌分布/成交额排排/涨跌幅榜（自动过滤 ST）
+#   Tab 2 个股详情 — K线(多周期+主力吸筹)/资金流向/财报/技术指标
+#   Tab 3 策略回测 — 单股回测/基准对比/参数优化/组合回测
+#   Tab 4 因子分析 — 因子值曲线 + IC 分析
+#   Tab 5 股票筛选 — 条件/模板/多因子排名（自动过滤 ST）
+#   Tab 6 交易建议 — 买入/止盈/止损 + 盈亏比
+#   侧边栏     — 代码+名称搜索 + 一键数据抓取
 ```
 
 ### 场景七：策略研究
@@ -490,6 +546,46 @@ python main.py factor --code 000559 --name momentum --ic
 # IC < 0     → 因子无效或反向
 ```
 
+### 场景八：参数优化 — 找到最优策略配置
+
+```bash
+# 1. 对双均线策略做网格搜索
+python main.py optimize --code 000559 --strategy sma_cross --start 20200101
+# → 测试 fast×slow = 16 组组合
+# → 最优参数: fast=3, slow=10
+# → 优化后收益 121% vs 默认参数 19%
+
+# 2. 多策略参数对比
+for s in sma_cross macd rsi kdj cci; do
+    echo "=== $s ==="
+    python main.py optimize --code 000559 --strategy $s --start 20200101
+done
+
+# 3. 验证优化效果 — 对比优化前后 + 基准
+python main.py benchmark --code 000559 --strategy sma_cross --start 20200101
+# → 策略 26.2% vs 买入持有 255.6% → ❌ 跑输
+```
+
+### 场景九：组合回测 — 验证策略普适性
+
+```bash
+# 1. 三只股票等权组合
+python main.py portfolio --codes "000001,000559,600519" --strategy macd --start 20200101
+# → 组合总收益/年化/回撤/夏普
+
+# 2. 对比单股 vs 组合
+python main.py backtest --code 000001 --strategy macd --start 20200101
+python main.py backtest --code 000559 --strategy macd --start 20200101
+python main.py backtest --code 600519 --strategy macd --start 20200101
+# → 组合收益通常比单股波动小、回撤低
+
+# 3. 不同策略跑组合
+for s in macd cci kdj mean_revert; do
+    echo "=== $s ==="
+    python main.py portfolio --codes "000001,000559,600519" --strategy $s --start 20200101
+done
+```
+
 ### 数据关系
 
 ```
@@ -508,9 +604,10 @@ fund_flow (资金流)            ├── code + report_date + report_type
 └── large/medium/small_net
     依赖 fund-flow 命令抓取
 
-筛选器 screener 读这三张表 → 输出符合条件的股票列表
-回测 backtest 从 history 取 OHLCV → 模拟交易
+筛选器 screener 读这三张表 → 输出符合条件的股票列表（自动过滤 ST/退市）
+回测 backtest 从 history 取 OHLCV → 单股/组合/优化/基准
 交易建议 advice 从 history + realtime 取数据 → 计算价位
+仓位管理 position 根据回测结果 → 计算最优仓位比例
 ```
 
 ## 常见问题
@@ -549,4 +646,5 @@ python main.py financial --code 600519 --type balance --save
 - 财务报表接口（新浪）按报告期返回，历史数据可追溯多年
 - 股票代码：沪市主板以 6 开头（如 600519 茅台），深市以 0/3 开头（如 000001 平安银行、300750 宁德时代）
 - 数据写入采用 `INSERT OR REPLACE` 策略，重复抓取不会产生重复记录
+- 筛选器和看板自动过滤 ST、*ST、N（新股首日）、PT、退市股票
 - 虚拟环境（`venv/`）和数据库（`data/`）已加入 `.gitignore`，不会提交到 Git

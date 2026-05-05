@@ -1,5 +1,5 @@
 from .metrics import sharpe_ratio, max_drawdown, annual_return, win_rate
-from .backtest import run_backtest
+from .backtest import run_backtest, optimize_backtest, portfolio_backtest, benchmark_compare
 from .factors import calc_factor, factor_ic
 from .screener import (
     screen, rank_screen,

@@ -10,7 +10,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from database import query, table_exists, save_dataframe, clear_code, get_conn
-from analytics import run_backtest, calc_factor, factor_ic, screen, get_advice
+from analytics import (
+    run_backtest, optimize_backtest, portfolio_backtest, benchmark_compare,
+    calc_factor, factor_ic, screen, get_advice,
+)
 from fetchers import HistoryFetcher, FinancialFetcher, FundFlowFetcher, RealtimeFetcher
 
 st.set_page_config(
@@ -70,7 +73,13 @@ with st.sidebar:
     @st.cache_data(ttl=600)
     def load_stock_list():
         if table_exists("realtime"):
-            return query("SELECT code, name FROM realtime ORDER BY code")
+            df = query("SELECT code, name FROM realtime ORDER BY code")
+            if not df.empty:
+                # 过滤 ST / *ST / 退市 / N开头新股
+                mask = ~df["name"].str.startswith(("ST", "*ST", "N", "PT"), na=False)
+                mask &= ~df["name"].str.contains("退", na=False)
+                df = df[mask]
+            return df
         return pd.DataFrame(columns=["code", "name"])
 
     df_all = load_stock_list()
@@ -236,6 +245,11 @@ with tab1:
         st.warning("⚠️ realtime 表不存在，请先抓取: `python main.py realtime`")
     else:
         df = query("SELECT code, name, price, change_pct, volume, amount, turnover, pe, pb FROM realtime")
+        # 过滤 ST / *ST / 退市 / N开头新股
+        if not df.empty:
+            mask = ~df["name"].str.startswith(("ST", "*ST", "N", "PT"), na=False)
+            mask &= ~df["name"].str.contains("退", na=False)
+            df = df[mask]
         if df.empty:
             st.warning("⚠️ realtime 表为空")
         else:
@@ -579,6 +593,85 @@ with tab3:
 
             except ValueError as e:
                 st.error(f"回测失败: {e}")
+
+    # ── 基准对比 / 参数优化 / 组合回测 ──────────────
+    st.markdown("---")
+    mode_bt = st.radio("扩展功能", ["基准对比", "参数优化", "组合回测"], horizontal=True)
+
+    if mode_bt == "基准对比":
+        if st.button("📊 对比买入持有基准", type="primary"):
+            with st.spinner("计算中..."):
+                try:
+                    bm = benchmark_compare(code, strat, start_date.strftime("%Y%m%d"),
+                                           end_date.strftime("%Y%m%d"), int(cash))
+                    c1, c2 = st.columns(2)
+                    excess = bm["excess_return"]
+                    tag = "✅ 跑赢基准" if excess > 0 else ("❌ 跑输基准" if excess < 0 else "➖ 持平")
+                    with c1:
+                        st.markdown(f"""
+                        <div class="metric-card {'up' if excess>0 else 'down'}">
+                            <div class="label">{tag}</div>
+                            <div class="value">{excess:+.2f}%</div>
+                            <div class="delta">超额收益</div>
+                        </div>""", unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(f"""
+                        <div class="metric-card neutral">
+                            <div class="label">策略 vs 基准</div>
+                            <div class="value">{bm['strategy_return']:.1f}% vs {bm['buy_hold_return']:.1f}%</div>
+                            <div class="delta">夏普 {bm['strategy_sharpe']:.2f} vs {bm['buy_hold_sharpe']:.2f}</div>
+                        </div>""", unsafe_allow_html=True)
+                except ValueError as e:
+                    st.error(f"失败: {e}")
+
+    elif mode_bt == "参数优化":
+        from analytics.backtest import PARAM_GRIDS
+        metric_opt = st.selectbox("优化目标", ["sharpe_ratio", "total_return_pct", "annual_return_pct"],
+                                  format_func=lambda x: {"sharpe_ratio": "夏普比率", "total_return_pct": "总收益率", "annual_return_pct": "年化收益"}.get(x, x))
+        opt_strats = [s for s in PARAM_GRIDS if PARAM_GRIDS[s]]
+        opt_strat = st.selectbox("策略", opt_strats, key="opt_strat")
+
+        grid = PARAM_GRIDS.get(opt_strat, {})
+        n_combos = 1
+        for v in grid.values():
+            n_combos *= len(v)
+        st.caption(f"搜索空间: {n_combos} 种组合")
+
+        if st.button("🔍 开始优化", type="primary"):
+            with st.spinner(f"参数优化中，测试 {n_combos} 组..."):
+                try:
+                    best_params, best_result, _ = optimize_backtest(
+                        code, opt_strat, start_date.strftime("%Y%m%d"),
+                        end_date.strftime("%Y%m%d"), int(cash), metric_opt,
+                    )
+                    if best_params:
+                        st.success(f"最优参数: {best_params}")
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("总收益", f"{best_result['total_return_pct']}%")
+                        c2.metric("夏普", f"{best_result['sharpe_ratio']:.2f}")
+                        c3.metric("最大回撤", f"{best_result['max_drawdown_pct']}%")
+                    else:
+                        st.warning("无结果")
+                except Exception as e:
+                    st.error(f"优化失败: {e}")
+
+    elif mode_bt == "组合回测":
+        extra_codes = st.text_input("额外股票代码（逗号分隔）", placeholder="如: 000001,600519,300750")
+        if st.button("📊 组合回测", type="primary"):
+            codes = [code] + [c.strip() for c in extra_codes.split(",") if c.strip()]
+            codes = list(dict.fromkeys(codes))  # 去重
+            with st.spinner(f"回测 {len(codes)} 只股票组合..."):
+                try:
+                    pf = portfolio_backtest(codes, strat, start_date.strftime("%Y%m%d"),
+                                            end_date.strftime("%Y%m%d"), int(cash))
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("股票数", pf["n_stocks"])
+                    c2.metric("总收益率", f"{pf['total_return_pct']}%")
+                    c3.metric("最大回撤", f"{pf['max_drawdown_pct']}%")
+                    c4.metric("夏普", f"{pf['sharpe_ratio']}")
+                    st.caption(f"股票池: {', '.join(pf['codes'])}")
+                except ValueError as e:
+                    st.error(f"失败: {e}")
 
 
 # ── Tab 4: 因子分析 ──────────────────────────────────────

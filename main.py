@@ -6,10 +6,12 @@ from fetchers import (
     RealtimeFetcher, HistoryFetcher, FinancialFetcher, FundFlowFetcher
 )
 from analytics import (
-    run_backtest, calc_factor, factor_ic, screen, rank_screen,
+    run_backtest, optimize_backtest, portfolio_backtest, benchmark_compare,
+    calc_factor, factor_ic, screen, rank_screen,
     value_screen, momentum_screen, quality_screen,
     breakout_screen, oversold_screen, growth_screen, get_advice,
 )
+from analytics.backtest import PARAM_GRIDS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -235,7 +237,120 @@ def backtest(code, strat, start, end, cash):
     click.echo(f"  胜率:     {result['win_rate_pct']}%")
 
 
-# ── factor ────────────────────────────────────────────────
+# ── optimize ───────────────────────────────────────────────
+
+@cli.command()
+@click.option("--code", required=True, help="股票代码")
+@click.option("--strategy", "strat", default="sma_cross",
+              type=click.Choice([s for s in PARAM_GRIDS.keys() if PARAM_GRIDS[s]]),
+              help="策略名称（仅显示有可调参数的策略）")
+@click.option("--start", default=None, help="起始日期")
+@click.option("--end", default=None, help="结束日期")
+@click.option("--cash", default=100000, help="初始资金")
+@click.option("--metric", default="sharpe_ratio",
+              type=click.Choice(["sharpe_ratio", "total_return_pct", "annual_return_pct"]),
+              help="优化目标")
+def optimize(code, strat, start, end, cash, metric):
+    """网格搜索优化策略参数"""
+    click.echo(f"\n🔍 优化 {strat} 策略参数（目标: {metric}）...")
+    grid = PARAM_GRIDS.get(strat, {})
+    n_combos = 1
+    for v in grid.values():
+        n_combos *= len(v)
+    click.echo(f"   搜索空间: {len(grid)} 个参数, {n_combos} 种组合")
+
+    best_params, best_result, all_results = optimize_backtest(
+        code, strategy=strat, start=start, end=end,
+        initial_cash=int(cash), metric=metric,
+    )
+
+    if not best_result:
+        click.echo("优化失败")
+        return
+
+    click.echo(f"\n✅ 最优参数: {best_params}")
+    click.echo(f"   总收益率: {best_result['total_return_pct']}%")
+    click.echo(f"   年化收益: {best_result['annual_return_pct']}%")
+    click.echo(f"   最大回撤: {best_result['max_drawdown_pct']}%")
+    click.echo(f"   夏普比率: {best_result['sharpe_ratio']}")
+    click.echo(f"   交易次数: {best_result['total_trades']}")
+    click.echo(f"   胜率:     {best_result['win_rate_pct']}%")
+    click.echo(f"   共测试 {best_result.get('_total_tested', 0)} 组参数")
+
+    # 对比默认参数
+    click.echo(f"\n📊 vs 默认参数:")
+    bench = benchmark_compare(code, strat, start, end, int(cash))
+    click.echo(f"   优化前收益: {bench['strategy_return']}%  →  优化后: {best_result['total_return_pct']}%")
+    click.echo(f"   vs 买入持有: {bench['buy_hold_return']}%  (超额: {bench['excess_return']}%)")
+
+
+# ── portfolio ─────────────────────────────────────────────
+
+@cli.command()
+@click.option("--codes", required=True, help="股票代码，逗号分隔，如 000001,600519,300750")
+@click.option("--strategy", "strat", default="sma_cross",
+              type=click.Choice(["sma_cross", "rsi", "buy_hold", "macd", "bollinger",
+                                 "ma_align", "turtle", "vol_breakout", "mean_revert",
+                                 "kdj", "cci", "williams_r", "donchian", "three_bar"]),
+              help="策略名称")
+@click.option("--start", default="20200101", help="起始日期")
+@click.option("--end", default=None, help="结束日期")
+@click.option("--cash", default=100000, help="初始资金")
+def portfolio(codes, strat, start, end, cash):
+    """多股组合回测"""
+    code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    click.echo(f"\n📊 组合回测: {len(code_list)} 只股票, 策略={strat}")
+
+    try:
+        result = portfolio_backtest(code_list, strategy=strat, start=start, end=end,
+                                    initial_cash=int(cash))
+    except ValueError as e:
+        click.echo(f"错误: {e}")
+        return
+
+    click.echo(f"\n{'='*50}")
+    click.echo(f"  组合回测结果")
+    click.echo(f"{'='*50}")
+    click.echo(f"  股票池:   {', '.join(result['codes'])} ({result['n_stocks']} 只)")
+    click.echo(f"  总收益率: {result['total_return_pct']}%")
+    click.echo(f"  年化收益: {result['annual_return_pct']}%")
+    click.echo(f"  最大回撤: {result['max_drawdown_pct']}%")
+    click.echo(f"  夏普比率: {result['sharpe_ratio']}")
+    click.echo(f"  交易次数: {result['total_trades']}")
+    click.echo(f"  胜率:     {result['win_rate_pct']}%")
+
+
+# ── benchmark ─────────────────────────────────────────────
+
+@cli.command()
+@click.option("--code", required=True, help="股票代码")
+@click.option("--strategy", "strat", default="macd",
+              type=click.Choice(["sma_cross", "rsi", "buy_hold", "macd", "bollinger",
+                                 "ma_align", "turtle", "vol_breakout", "mean_revert",
+                                 "kdj", "cci", "williams_r", "donchian", "three_bar"]),
+              help="策略名称")
+@click.option("--start", default="20200101", help="起始日期")
+@click.option("--end", default=None, help="结束日期")
+@click.option("--cash", default=100000, help="初始资金")
+def benchmark(code, strat, start, end, cash):
+    """策略 vs 买入持有 基准对比"""
+    result = benchmark_compare(code, strat, start, end, int(cash))
+    excess = result["excess_return"]
+    tag = "✅ 跑赢" if excess > 0 else ("❌ 跑输" if excess < 0 else "➖ 持平")
+
+    click.echo(f"""
+╔══════════════════════════════════════════╗
+║  {result['code']}  {result['strategy']} vs 买入持有(基准)
+╠══════════════════════════════════════════╣
+║          策略        买入持有      超额
+║  收益    {result['strategy_return']:>8.2f}%  {result['buy_hold_return']:>8.2f}%  {excess:>8.2f}%  {tag}
+║  夏普    {result['strategy_sharpe']:>8.2f}   {result['buy_hold_sharpe']:>8.2f}
+║  回撤    {result['strategy_mdd']:>8.2f}%  {result['buy_hold_mdd']:>8.2f}%
+║  区间: {result['period']}
+╚══════════════════════════════════════════╝
+""")
+
+
 
 @cli.command()
 @click.option("--code", required=True, help="股票代码")

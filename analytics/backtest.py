@@ -339,3 +339,155 @@ def run_backtest(code, strategy="sma_cross", start=None, end=None,
         "total_trades": total_trades,
         "win_rate_pct": round(won / total_trades * 100, 1) if total_trades else 0.0,
     }
+
+
+# ── 参数网格定义 ──────────────────────────────────────────
+
+PARAM_GRIDS = {
+    "sma_cross": {"fast": [3, 5, 10, 15], "slow": [10, 20, 30, 60]},
+    "macd": {"fast": [8, 12, 16], "slow": [20, 26, 34], "signal": [6, 9, 12]},
+    "rsi": {"period": [7, 14, 21], "oversold": [20, 25, 30], "overbought": [65, 70, 80]},
+    "bollinger": {"period": [10, 20, 30], "devfactor": [1.5, 2.0, 2.5]},
+    "ma_align": {"ma_short": [3, 5, 8], "ma_mid": [8, 10, 15], "ma_long": [15, 20, 30]},
+    "turtle": {"entry_period": [10, 20, 30], "exit_period": [5, 10, 15]},
+    "vol_breakout": {"price_period": [10, 20, 30], "vol_factor": [1.2, 1.5, 2.0]},
+    "mean_revert": {"period": [10, 20, 30], "devfactor": [1.5, 2.0, 2.5]},
+    "kdj": {"period": [5, 9, 14], "period_d": [2, 3, 5], "oversold": [15, 20, 25], "overbought": [75, 80, 85]},
+    "cci": {"period": [10, 14, 20, 30], "oversold": [-150, -100, -80], "overbought": [80, 100, 150]},
+    "williams_r": {"period": [7, 14, 21], "oversold": [-90, -80, -70], "exit": [-30, -20, -10]},
+    "donchian": {"period": [10, 20, 30]},
+    "three_bar": {},
+    "buy_hold": {},
+}
+
+
+# ── 参数优化 ──────────────────────────────────────────────
+
+def optimize_backtest(code, strategy="sma_cross", start=None, end=None,
+                      initial_cash=100000, metric="sharpe_ratio"):
+    """网格搜索最优参数。返回 (best_params, best_result, all_results)。"""
+    grid = PARAM_GRIDS.get(strategy, {})
+    if not grid:
+        # 无参数可调，直接跑一次
+        r = run_backtest(code, strategy, start, end, initial_cash)
+        return {}, r, [r]
+
+    import itertools
+
+    keys = list(grid.keys())
+    combinations = list(itertools.product(*grid.values()))
+    best_result = None
+    best_params = None
+    all_results = []
+
+    for combo in combinations:
+        params = dict(zip(keys, combo))
+        try:
+            r = run_backtest(code, strategy, start, end, initial_cash, **params)
+            r["_params"] = params
+            all_results.append(r)
+            val = r.get(metric, 0)
+            if best_result is None or val > best_result.get(metric, 0):
+                best_result = r
+                best_params = params
+        except Exception:
+            continue
+
+    if best_result is None:
+        return {}, {}, []
+    best_result["_best_params"] = best_params
+    best_result["_total_tested"] = len(all_results)
+    return best_params, best_result, all_results
+
+
+# ── 组合回测 ──────────────────────────────────────────────
+
+def portfolio_backtest(codes, strategy="sma_cross", start=None, end=None,
+                       initial_cash=100000, **strat_params):
+    """多股等权组合回测，返回组合绩效。"""
+    if start is None:
+        start = (datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y%m%d")
+    if end is None:
+        end = datetime.date.today().strftime("%Y%m%d")
+
+    cerebro = bt.Cerebro()
+    cerebro.broker.setcash(initial_cash)
+    cerebro.broker.setcommission(commission=0.0003)
+
+    valid_codes = []
+    for code in codes:
+        df = _load_data(code, start, end)
+        if not df.empty:
+            data = bt.feeds.PandasData(dataname=df)
+            cerebro.adddata(data, name=code)
+            valid_codes.append(code)
+
+    if not valid_codes:
+        raise ValueError(f"所有股票在 {start}~{end} 均无数据")
+
+    strat_cls = STRATEGIES.get(strategy, SmaCrossStrategy)
+    cerebro.addstrategy(strat_cls, **strat_params)
+
+    # 等权仓位
+    weight_per_stock = 95.0 / len(valid_codes) if valid_codes else 95
+    cerebro.addsizer(bt.sizers.PercentSizer, percents=weight_per_stock)
+
+    cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="timereturn", timeframe=bt.TimeFrame.Days)
+    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
+
+    results = cerebro.run()
+    strat_instance = results[0]
+
+    time_return = strat_instance.analyzers.timereturn.get_analysis()
+    if time_return:
+        daily_rets = np.array(list(time_return.values()))
+    else:
+        daily_rets = np.array([0.0])
+
+    ta = strat_instance.analyzers.trades.get_analysis()
+    total_trades = ta.get("total", {}).get("total", 0)
+    won = ta.get("won", {}).get("total", 0)
+
+    final_value = cerebro.broker.getvalue()
+    total_return = (final_value - initial_cash) / initial_cash * 100
+    ann_ret = (np.prod(1 + daily_rets) ** (252 / len(daily_rets)) - 1) * 100 if len(daily_rets) > 0 else 0.0
+    mdd = max_drawdown(np.cumprod(1 + daily_rets)) * 100
+    sharpe = sharpe_ratio(daily_rets)
+
+    return {
+        "codes": valid_codes,
+        "n_stocks": len(valid_codes),
+        "strategy": strategy,
+        "period": f"{start} ~ {end}",
+        "days": len(daily_rets),
+        "initial_cash": initial_cash,
+        "final_value": round(final_value, 2),
+        "total_return_pct": round(total_return, 2),
+        "annual_return_pct": round(ann_ret, 2),
+        "max_drawdown_pct": round(mdd, 2),
+        "sharpe_ratio": round(sharpe, 2) if sharpe else 0.0,
+        "total_trades": total_trades,
+        "win_rate_pct": round(won / total_trades * 100, 1) if total_trades else 0.0,
+    }
+
+
+# ── 基准对比 ──────────────────────────────────────────────
+
+def benchmark_compare(code, strategy="sma_cross", start=None, end=None,
+                      initial_cash=100000, **strat_params):
+    """对比策略 vs 买入持有基准。"""
+    strat_result = run_backtest(code, strategy, start, end, initial_cash, **strat_params)
+    bench_result = run_backtest(code, "buy_hold", start, end, initial_cash)
+
+    return {
+        "code": code,
+        "strategy": strategy,
+        "strategy_return": strat_result["total_return_pct"],
+        "buy_hold_return": bench_result["total_return_pct"],
+        "excess_return": round(strat_result["total_return_pct"] - bench_result["total_return_pct"], 2),
+        "strategy_sharpe": strat_result["sharpe_ratio"],
+        "buy_hold_sharpe": bench_result["sharpe_ratio"],
+        "strategy_mdd": strat_result["max_drawdown_pct"],
+        "buy_hold_mdd": bench_result["max_drawdown_pct"],
+        "period": strat_result["period"],
+    }

@@ -110,10 +110,18 @@ def quality_screen(pe_max=30, roe_min=15):
 # 估值面 Filter（realtime 表）
 # ═══════════════════════════════════════════════════════════
 
-def _all_stocks():
+_ST_PATTERNS = ["ST", "*ST", "N", "退", "PT"]  # ST/退市/新股首日过滤
+
+
+def _all_stocks(exclude_st=True):
     if not table_exists("realtime"):
         return pd.DataFrame()
-    return query("SELECT * FROM realtime")
+    df = query("SELECT * FROM realtime")
+    if exclude_st and not df.empty:
+        mask = ~df["name"].str.startswith(tuple(_ST_PATTERNS), na=False)
+        mask &= ~df["name"].str.contains("退", na=False)
+        df = df[mask]
+    return df
 
 
 def _filter_pe_max(df, val):
