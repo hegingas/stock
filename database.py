@@ -99,6 +99,39 @@ def init_db():
             cf_financing       REAL,
             PRIMARY KEY (code, report_date, report_type)
         );
+
+        CREATE TABLE IF NOT EXISTS hot_rank (
+            code       TEXT NOT NULL,
+            name       TEXT,
+            rank       INTEGER,
+            price      REAL,
+            change_amt REAL,
+            change_pct REAL,
+            fetch_date TEXT DEFAULT (date('now','localtime')),
+            PRIMARY KEY (code, fetch_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS hot_up (
+            code        TEXT NOT NULL,
+            name        TEXT,
+            rank        INTEGER,
+            rank_change INTEGER,
+            price       REAL,
+            change_amt  REAL,
+            change_pct  REAL,
+            fetch_date  TEXT DEFAULT (date('now','localtime')),
+            PRIMARY KEY (code, fetch_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS stock_news (
+            code     TEXT NOT NULL,
+            title    TEXT,
+            content  TEXT,
+            pub_time TEXT,
+            source   TEXT,
+            url      TEXT,
+            PRIMARY KEY (code, url)
+        );
     """)
     # 迁移：确保新字段存在
     cur = conn.execute("PRAGMA table_info(realtime)")
@@ -118,11 +151,39 @@ def init_db():
     conn.close()
 
 
+# 各表主键列，用于写入前先删冲突行，避免 UNIQUE 约束导致整批回滚
+_PK_COLS = {
+    "realtime": ["code"],
+    "history": ["code", "date"],
+    "fund_flow": ["code", "date"],
+    "lhb": ["code", "date"],
+    "north_flow": ["date"],
+    "financial": ["code", "report_date", "report_type"],
+    "hot_rank": ["code", "fetch_date"],
+    "hot_up": ["code", "fetch_date"],
+    "stock_news": ["code", "url"],
+}
+
+
 def save_dataframe(df, table_name, conn=None):
     own_conn = conn is None
     if own_conn:
         conn = get_conn()
     try:
+        keys = _PK_COLS.get(table_name)
+        if keys:
+            existing_keys = df[keys].drop_duplicates()
+            placeholders = ", ".join(["?"] * len(keys))
+            # 分批删除，避免超出 SQLite 999 参数上限
+            batch_size = 500 // len(keys)
+            for i in range(0, len(existing_keys), batch_size):
+                batch = existing_keys.iloc[i : i + batch_size]
+                values = [row[col] for _, row in batch.iterrows() for col in keys]
+                row_phs = ", ".join(["(" + placeholders + ")"] * len(batch))
+                conn.execute(
+                    f"DELETE FROM {table_name} WHERE ({', '.join(keys)}) IN ({row_phs})",
+                    values,
+                )
         df.to_sql(table_name, conn, if_exists="append", index=False)
     finally:
         if own_conn:

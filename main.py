@@ -1,9 +1,10 @@
+import datetime
 import logging
 import click
 from database import init_db, save_dataframe, query, table_exists
 from exporters import export
 from fetchers import (
-    RealtimeFetcher, HistoryFetcher, FinancialFetcher, FundFlowFetcher
+    RealtimeFetcher, HistoryFetcher, FinancialFetcher, FundFlowFetcher, HotspotFetcher
 )
 from analytics import (
     run_backtest, optimize_backtest, portfolio_backtest, benchmark_compare, rolling_backtest,
@@ -193,6 +194,142 @@ def north_flow(save, export_csv):
         click.echo("已保存到 north_flow 表")
     if export_csv:
         export("north_flow", fmt="csv")
+
+
+# ── hot ────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--type", "hot_type", default="analyze",
+              type=click.Choice(["analyze", "rank", "up", "news"]),
+              help="模式: analyze(默认:Top20深度分析) / rank(仅人气榜) / up(热门上涨) / news(个股新闻)")
+@click.option("--top", default=20, help="深度分析前 N 只（默认 20）")
+@click.option("--strategy", "strat", default="macd", help="回测策略")
+@click.option("--code", default=None, help="个股代码（--type news 时必填）")
+@click.option("--no-save", is_flag=True, help="仅查看不存储")
+def hot(hot_type, top, strat, code, no_save):
+    """实时热点 — 人气榜深度分析 / 热门上涨 / 个股新闻"""
+    fetcher = HotspotFetcher()
+
+    # ── news 模式 ──
+    if hot_type == "news":
+        if not code:
+            click.echo("❌ --type news 需要指定 --code")
+            return
+        click.echo(f"\n📰 拉取 {code} 个股新闻...")
+        df = fetcher.fetch_news(code)
+        if df is None or df.empty:
+            click.echo("无新闻")
+            return
+        click.echo(f"获取到 {len(df)} 条新闻\n")
+        for _, r in df.head(10).iterrows():
+            click.echo(f"  [{r.get('pub_time','')[:10]}] {r['title']}")
+            if r.get("content"):
+                click.echo(f"    {r['content'][:80]}...")
+            click.echo(f"    来源: {r.get('source','')}  {r.get('url','')}\n")
+        if not no_save:
+            save_dataframe(df, "stock_news")
+            click.echo(f"已保存 {len(df)} 条到 stock_news 表")
+        return
+
+    # ── rank 模式（仅拉取）──
+    if hot_type == "rank":
+        click.echo("🔥 拉取全市场人气榜 Top 100...")
+        df = fetcher.fetch_hot_rank()
+        if df is None or df.empty:
+            click.echo("无数据")
+            return
+        click.echo(f"人气榜 Top 10:\n{df.head(10).to_string(index=False)}\n")
+        if not no_save:
+            save_dataframe(df, "hot_rank")
+            click.echo(f"已保存 {len(df)} 条到 hot_rank 表")
+        return
+
+    # ── up 模式 ──
+    if hot_type == "up":
+        click.echo("📈 拉取热门上涨榜...")
+        df = fetcher.fetch_hot_up()
+        if df is None or df.empty:
+            click.echo("无数据")
+            return
+        click.echo(f"热门上涨 Top 10:\n{df.head(10).to_string(index=False)}\n")
+        if not no_save:
+            save_dataframe(df, "hot_up")
+            click.echo(f"已保存 {len(df)} 条到 hot_up 表")
+        return
+
+    # ── analyze 模式（默认）──
+    click.echo(f"\n🔥 拉取人气榜 Top {top}...")
+    df_rank = fetcher.fetch_hot_rank()
+    if df_rank is None or df_rank.empty:
+        click.echo("无法获取人气榜数据")
+        return
+
+    if not no_save:
+        save_dataframe(df_rank, "hot_rank")
+
+    # 人气榜代码含 SH/SZ 前缀，去除以匹配历史/实时数据
+    df_rank["code_raw"] = df_rank["code"]
+    df_rank["code"] = df_rank["code"].str.replace(r"^(SH|SZ)", "", regex=True)
+    top_codes = df_rank.head(top)["code"].tolist()
+    top_names = dict(zip(df_rank["code"], df_rank["name"]))
+    top_changes = dict(zip(df_rank["code"], df_rank["change_pct"]))
+
+    click.echo(f"\n🔍 对 Top {top} 逐一深度分析（策略={strat}）...")
+    click.echo("   每只: 技术指标 + 回测 + 信号判断，预计 10-20 秒\n")
+
+    from analytics.hot_analysis import analyze_hot_stocks
+
+    report = analyze_hot_stocks(top_codes, strategy=strat)
+
+    if report.empty:
+        click.echo("所有股票分析失败，请检查数据是否完整")
+        return
+
+    # 统计
+    buy_n = int((report["signal"] == "buy").sum()) if "signal" in report.columns else 0
+    sell_n = int((report["signal"] == "sell").sum()) if "signal" in report.columns else 0
+    hold_n = int((report["signal"] == "hold").sum()) if "signal" in report.columns else 0
+    err_n = int(report["error"].notna().sum())
+
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    click.echo(f"╔══════════════════════════════════════════════════════════════════════════════╗")
+    click.echo(f"║  人气榜 Top {top} 深度分析  ({today_str})  {' ' * 28}║")
+    click.echo(f"╠══════════════════════════════════════════════════════════════════════════════╣")
+    click.echo(f"║  🟢 买入 {buy_n:<4}  🔴 卖出 {sell_n:<4}  🟡 观望 {hold_n:<4}  ❌ 失败 {err_n:<4} {' ' * 23}║")
+    click.echo(f"╠══════════════════════════════════════════╦═══════════╦═══════════╦════════════╣")
+    click.echo(f"║  代码     名称          现价      涨跌   ║ 信号  信心 ║ 收益   夏普 ║ 建议买入   ║")
+    click.echo(f"╠══════════════════════════════════════════╬═══════════╬═══════════╬════════════╣")
+
+    for _, r in report.iterrows():
+        err = r.get("error")
+        if err and not isinstance(err, float):
+            # 有错误的股票
+            code_str = str(r.get("code", "?"))
+            name_str = str(top_names.get(code_str, "?"))[:6]
+            err_msg = str(err)[:30]
+            click.echo(f"║  {code_str:<8} {name_str:<8}  {'—':>8} {'—':>8} ║ ❌ {err_msg:<22} ║")
+            continue
+
+        code_s = str(r["code"])
+        name_s = str(r.get("name", top_names.get(code_s, "")))[:8]
+        price_s = f"{r['price']:6.2f}" if r.get("price") else "     —"
+        chg = top_changes.get(code_s, 0) or 0
+        chg_s = f"{chg:+6.2f}%" if chg else "     —"
+        trend_s = str(r.get("trend", ""))[:8]
+
+        sig = r.get("signal", "hold")
+        sig_icon = {"buy": "🟢买入", "sell": "🔴卖出", "hold": "🟡观望"}.get(sig, "❓")
+        conf = str(r.get("confidence", ""))[:4]
+        bt_ret = f"{r.get('bt_return',0) or 0:+5.1f}%"
+        bt_sharpe = f"{r.get('bt_sharpe',0) or 0:5.2f}"
+        buy_p = f"{r.get('buy_price',0) or 0:6.2f}"
+
+        click.echo(f"║  {code_s:<8} {name_s:<8} {price_s:>8} {chg_s:>8} ║ {sig_icon:<5} {conf:<4} ║ {bt_ret:>7} {bt_sharpe:>5} ║ {buy_p:>8} ║")
+
+    click.echo(f"╚══════════════════════════════════════════╩═══════════╩═══════════╩════════════╝")
+
+    if err_n > 0:
+        click.echo(f"\n⚠️  {err_n} 只股票分析失败（数据缺失），可先执行 realtime / history 补充数据")
 
 
 # ── export ────────────────────────────────────────────────
@@ -788,6 +925,115 @@ def eod():
     acc = SimAccount()
     acc.process_eod()
     click.echo("✅ 日终撮合完成")
+
+
+# ── notify ─────────────────────────────────────────────────
+
+@cli.group()
+def notify():
+    """邮件推送通知"""
+    pass
+
+
+@notify.command()
+@click.option("--codes", default=None, help="股票代码逗号分隔，默认取持仓+实时列表")
+@click.option("--strategy", "strat", default="macd", help="参考策略")
+@click.option("--top", default=10, help="最多推送前 N 条信号")
+@click.option("--dry-run", is_flag=True, help="仅预览不发送邮件")
+def scan(codes, strat, top, dry_run):
+    """信号扫描 → 邮件推送（仅当有 buy/sell 信号时发送）"""
+    from notify import send_email, build_signal_html, _strip_html
+
+    if codes:
+        code_list = [c.strip() for c in codes.split(",") if c.strip()]
+    else:
+        code_list = []
+        if table_exists("realtime"):
+            rdf = query("SELECT code FROM realtime LIMIT 20")
+            code_list = rdf["code"].tolist() if not rdf.empty else []
+        if table_exists("positions"):
+            pdf = query("SELECT code FROM positions")
+            for c in pdf["code"].tolist():
+                if c not in code_list:
+                    code_list.append(c)
+
+    if not code_list:
+        click.echo("无股票代码，请 --codes 指定或先执行 realtime / trade")
+        return
+
+    click.echo(f"\n🔍 扫描 {len(code_list)} 只股票（策略={strat}）...")
+    df = scan_signals(code_list, strategy=strat, top=top)
+
+    if df.empty:
+        click.echo("无信号，跳过推送")
+        return
+
+    actionable = df[df["signal"].isin(["buy", "sell"])]
+    if actionable.empty:
+        click.echo(f"仅有 hold 信号（{len(df)}条），无买卖信号，跳过推送")
+        return
+
+    buy_n = int((df["signal"] == "buy").sum())
+    sell_n = int((df["signal"] == "sell").sum())
+    click.echo(f"共 {len(df)} 条信号: 🟢买入 {buy_n}  🔴卖出 {sell_n}")
+
+    html = build_signal_html(df)
+    if dry_run:
+        click.echo("\n[DRY RUN] 邮件预览:\n")
+        click.echo(_strip_html(html))
+        return
+
+    ok = send_email(
+        subject=f"股票信号推送 - {buy_n}买入 {sell_n}卖出",
+        html_body=html,
+    )
+    click.echo("✅ 邮件已发送" if ok else "❌ 邮件发送失败，请检查 SMTP 配置")
+
+
+@notify.command()
+@click.option("--dry-run", is_flag=True, help="仅预览不发送邮件")
+def daily(dry_run):
+    """每日持仓报告 → 邮件推送"""
+    from notify import send_email, build_daily_report_html, _strip_html
+
+    pf = Portfolio()
+    summary = pf.get_summary()
+    positions = pf.get_positions()
+
+    html = build_daily_report_html(positions, summary)
+
+    if dry_run:
+        click.echo("\n[DRY RUN] 邮件预览:\n")
+        click.echo(_strip_html(html))
+        return
+
+    date_str = datetime.date.today().strftime("%Y-%m-%d")
+    ok = send_email(
+        subject=f"持仓日报 {date_str} - {summary.get('open_positions',0)}只持仓",
+        html_body=html,
+    )
+    click.echo("✅ 邮件已发送" if ok else "❌ 邮件发送失败，请检查 SMTP 配置")
+
+
+@notify.command()
+@click.option("--to", "to_addr", default=None, help="测试收件人（覆盖默认配置）")
+def test(to_addr):
+    """发送测试邮件，验证 SMTP 配置"""
+    from notify import send_email
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:'Microsoft YaHei',Arial,sans-serif;max-width:600px;margin:0 auto;padding:16px">
+<h2 style="color:#27ae60">股票分析系统 - 测试邮件</h2>
+<p>SMTP 配置正确，邮件推送功能正常工作。</p>
+<p style="color:#888">发送时间: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+</body>
+</html>"""
+
+    to_list = [to_addr] if to_addr else None
+    ok = send_email(subject="股票分析系统 - 测试邮件", html_body=html, to_addrs=to_list)
+    click.echo("✅ 测试邮件发送成功" if ok else "❌ 测试邮件发送失败，请检查 SMTP 配置")
 
 
 # ── status ────────────────────────────────────────────────

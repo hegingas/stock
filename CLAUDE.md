@@ -12,7 +12,12 @@ python main.py financial --code 600519 --type income  # 利润表/balance/cashfl
 python main.py fund-flow --code 000001     # 个股资金流向
 python main.py lhb                         # 龙虎榜（默认昨天）
 python main.py north-flow                  # 北向资金
-python main.py industry                    # 东方财富行业分类（约2-3分钟）
+python main.py hot                           # 人气榜 Top 20 深度分析（技术+回测+买入/卖出建议，约10-20秒）
+python main.py hot --top 30 --strategy sma_cross # Top 30 用指定策略分析
+python main.py hot --type rank               # 仅拉取人气榜（不做分析）
+python main.py hot --type up                 # 热门上涨榜
+python main.py hot --type news --code 000559 # 个股新闻
+python main.py industry                      # 东方财富行业分类（约2-3分钟）
 
 # 策略回测
 python main.py backtest --code 000559 --strategy macd      # 单股回测（14种策略）
@@ -39,6 +44,13 @@ python main.py sim order --code 000559 --direction buy --quantity 100 --order-ty
 python main.py sim orders --type pending                    # 查看待成交订单
 python main.py sim cancel --id 3                            # 撤单
 python main.py sim status                                   # 模拟账户状态
+
+# 邮件推送
+python main.py notify scan                                  # 信号扫描 → 邮件（仅买卖信号）
+python main.py notify scan --codes "000559,600519" --dry-run # 预览模式
+python main.py notify daily                                 # 每日持仓报告 → 邮件
+python main.py notify test                                  # 测试 SMTP 配置
+# 环境变量: STOCK_SMTP_HOST / PORT / USER / PASS / FROM / TO / TLS
 
 # 看板与工具
 python main.py dashboard                   # 启动 Streamlit 看板
